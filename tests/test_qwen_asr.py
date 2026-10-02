@@ -162,7 +162,10 @@ class TestQwenASRInitialization:
 
         asr = QwenASR()
 
-        assert asr.model_id == "Qwen/Qwen3-ASR-1.7B"
+        # Assert against the class constant rather than a literal: the default
+        # is the JA Anime/Galgame finetune, and pinning the literal here made
+        # this test go stale the last time the default moved.
+        assert asr.model_id == QwenASR.DEFAULT_MODEL_ID
         assert asr.device_request == "auto"
         assert asr.dtype_request == "auto"
         assert asr.batch_size == 1  # Default batch_size=1 for accuracy
@@ -389,7 +392,7 @@ class TestQwenASRRepr:
         repr_str = repr(asr)
 
         assert "QwenASR" in repr_str
-        assert "Qwen/Qwen3-ASR-1.7B" in repr_str
+        assert QwenASR.DEFAULT_MODEL_ID in repr_str
         assert "use_aligner=True" in repr_str
 
 

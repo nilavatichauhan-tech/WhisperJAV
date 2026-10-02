@@ -62,6 +62,7 @@ from typing import Optional
 from .providers import PROVIDER_CONFIGS, SUPPORTED_SOURCES, SUPPORTED_TARGETS
 from .core import translate_subtitle, _normalize_api_base, _api_base_to_custom_server, cap_batch_size_for_context, compute_max_output_tokens
 from .instructions import get_instruction_content, get_cache_dir
+from .service import _inject_glossary
 from .settings import load_settings, create_default_settings, show_settings, get_settings_path, resolve_config
 from .configure import configure_command
 
@@ -184,6 +185,19 @@ def resolve_instruction_file_or_content(args, merged: dict) -> Optional[str]:
     instruction_content = get_instruction_content(tone=tone, refresh=False)
 
     if instruction_content:
+        # Same injection service._resolve_instruction_file() performs. This
+        # function duplicates that resolver (it additionally honours
+        # --instructions-file), and without this call the CLI path — which is
+        # how every `whisperjav-translate` run resolves instructions — shipped
+        # the tone file with no glossary. Measured: both hy-mt1.5 and
+        # qwen2.5-abliterate rendered おちんちん/おまんこ as "penis"/"vagina"
+        # because the term list never reached the model.
+        #
+        # Only the tone-derived path is injected. An explicit
+        # --instructions-file is returned untouched above: the user handed us
+        # a specific prompt and silently appending to it would be surprising.
+        instruction_content = _inject_glossary(instruction_content)
+
         # Save to temp file
         temp_dir = Path(tempfile.gettempdir()) / 'whisperjav_translate'
         temp_dir.mkdir(exist_ok=True)
@@ -408,20 +422,42 @@ def main():
         return
 
     if args.list_ollama_models:
-        from .ollama_manager import OllamaManager
+        from .ollama_manager import OllamaManager, is_uncensored
         mgr = OllamaManager(base_url=getattr(args, 'ollama_url', None))
         if not mgr.detect_server():
             print("Ollama server not running.", file=sys.stderr)
             sys.exit(1)
+        # Recommend by detected VRAM rather than naming a fixed model: the old
+        # hint was 'ollama pull gemma3:12b', which is both safety-aligned (it
+        # refuses explicit dialogue) and 8.1 GB, so it does not fit the 8 GB
+        # cards this tool is most often run on.
+        try:
+            rec = mgr.recommend_model()
+        except Exception:
+            rec = None
         models = mgr.list_models()
         if not models:
-            print("No models found. Pull one with: ollama pull gemma3:12b", file=sys.stderr)
+            hint = rec.name if rec else 'huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M'
+            print(f"No models found. Pull one with: ollama pull {hint}", file=sys.stderr)
         else:
-            print(f"{'Model':<30s}  {'Size':>10s}")
-            print(f"{'-'*30}  {'-'*10}")
+            # The alignment column is the point of this listing for JAV work: a
+            # user cannot otherwise tell which of their installed models will
+            # write refusal text into the subtitle track.
+            print(f"{'Model':<52s}  {'Size':>8s}  {'Alignment':<12s}")
+            print(f"{'-'*52}  {'-'*8}  {'-'*12}")
             for m in models:
                 size = m.get('details', {}).get('parameter_size', '?')
-                print(f"  {m['name']:<30s}  {size:>8s}")
+                tier = 'uncensored' if is_uncensored(m['name']) else 'ALIGNED'
+                print(f"{m['name']:<52s}  {size:>8s}  {tier:<12s}")
+            print()
+            print("ALIGNED models refuse or self-censor explicit dialogue — see")
+            print("whisperjav/translate/refusal.py for what that looks like in output.")
+        if rec:
+            print()
+            print(f"Recommended: {rec.name}  ({rec.download_size}, {rec.quality})")
+            print(f"  {rec.note}")
+            if not mgr.check_model(rec.name):
+                print(f"  Not installed. Pull it with: ollama pull {rec.name}")
         return
 
     # Validate and collect input files (supports files, directories, and glob patterns)

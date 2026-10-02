@@ -391,7 +391,9 @@ def prepare_transformers_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
 
 # Default Qwen3-ASR parameters
 DEFAULT_QWEN_PARAMS = {
-    "qwen_model_id": "Qwen/Qwen3-ASR-1.7B",
+    # Japanese anime/galgame finetune of Qwen/Qwen3-ASR-1.7B -- identical architecture
+    # and VRAM cost, ~42% lower deletion rate on expressive speech.
+    "qwen_model_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     "qwen_device": "auto",
     "qwen_dtype": "auto",
     "qwen_batch_size": 1,
@@ -418,6 +420,7 @@ DEFAULT_QWEN_PARAMS = {
     "qwen_max_tokens_per_second": 20.0,
     "qwen_stepdown": True,
     "qwen_generator_backend": "qwen3",
+    "qwen_vllm_url": "http://localhost:8000/v1",
     "qwen_regroup_mode": "off",
     # NOTE: qwen_max_group_duration, qwen_chunk_threshold,
     # qwen_stepdown_initial_group, and qwen_stepdown_fallback_group are
@@ -467,6 +470,7 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
         "regroup_mode": "qwen_regroup_mode",
         "chunk_threshold": "qwen_chunk_threshold",
         "generator_backend": "qwen_generator_backend",
+        "vllm_url": "qwen_vllm_url",
         "vad_threshold": "qwen_vad_threshold",
         "vad_padding": "qwen_vad_padding",        # legacy symmetric padding (back-compat)
         "vad_start_pad": "qwen_vad_start_pad",     # v1.9.0 asymmetric: pad before onset
@@ -1263,7 +1267,7 @@ def _build_pipeline(
 
         # Map qwen_* prefixed params to QwenPipeline's parameter names
         qwen_pipeline_params = {
-            "model_id": qwen_defaults.get("qwen_model_id", "Qwen/Qwen3-ASR-1.7B"),
+            "model_id": qwen_defaults.get("qwen_model_id", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"),
             "device": qwen_defaults.get("qwen_device", "auto"),
             "dtype": qwen_defaults.get("qwen_dtype", "auto"),
             "batch_size": qwen_defaults.get("qwen_batch_size", 1),
@@ -1290,6 +1294,7 @@ def _build_pipeline(
             "max_tokens_per_audio_second": qwen_defaults.get("qwen_max_tokens_per_second", 20.0),
             "stepdown_enabled": qwen_defaults.get("qwen_stepdown", True),
             "generator_backend": qwen_defaults.get("qwen_generator_backend", "qwen3"),
+            "qwen_vllm_url": qwen_defaults.get("qwen_vllm_url", "http://localhost:8000/v1"),
             "regroup_mode": qwen_defaults.get("qwen_regroup_mode", "standard"),
             "segmenter_config": segmenter_config if segmenter_config else None,
         }

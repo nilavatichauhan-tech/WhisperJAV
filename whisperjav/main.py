@@ -250,9 +250,13 @@ def parse_arguments():
                                help="VAD threshold for pass 2 (0.0-1.0)")
     twopass_group.add_argument("--pass2-speech-pad-ms", type=int, default=None,
                                help="Speech padding in ms for pass 2")
-    twopass_group.add_argument("--merge-strategy", default="pass1_primary",
+    twopass_group.add_argument("--merge-strategy", default="pass2_primary",
                                choices=["pass1_primary", "pass2_primary", "smart_merge", "full_merge", "pass1_overlap", "pass2_overlap", "longest"],
-                               help="Merge strategy for two-pass results (default: pass1_primary)")
+                               help="Merge strategy for two-pass results (default: pass2_primary). "
+                                    "pass2_primary makes Pass 2 authoritative and fills its gaps from Pass 1 — "
+                                    "correct when Pass 2 runs the in-domain Qwen3-ASR JA finetune (-42%% deletions vs base). "
+                                    "Use pass1_primary to invert that trust, or smart_merge to adjudicate each "
+                                    "overlapping pair by cue coverage with a hallucination gate.")
     twopass_group.add_argument("--ensemble-serial", action="store_true",
                                help="Complete each file (Pass1+Pass2+Merge) before starting the next. "
                                     "Slower (reloads models per file) but delivers results incrementally.")
@@ -540,12 +544,19 @@ def parse_arguments():
     # ── Qwen3-ASR: Model ────────────────────────────────────────────────
     qwen_model_group = parser.add_argument_group("Qwen3-ASR: Model")
     qwen_model_group.add_argument("--qwen-generator", type=str, default="qwen3",
-                           choices=["qwen3", "anime-whisper"],
+                           choices=["qwen3", "qwen3-vllm", "anime-whisper", "cohere"],
                            help="Text generator backend (default: qwen3). "
-                                "anime-whisper uses litagin/anime-whisper for anime/VN dialogue")
+                                "qwen3-vllm uses a local vLLM REST server. "
+                                "anime-whisper uses litagin/anime-whisper for anime/VN dialogue. "
+                                "cohere uses Cohere Transcribe-03-2026.")
+    qwen_model_group.add_argument("--qwen-vllm-url", type=str, default="http://localhost:8000/v1",
+                           help="Base URL for the vLLM OpenAI-compatible server (default: http://localhost:8000/v1)")
     qwen_model_group.add_argument("--qwen-model-id", type=str,
-                           default="Qwen/Qwen3-ASR-1.7B",
-                           help="Qwen3-ASR model ID (default: Qwen/Qwen3-ASR-1.7B)")
+                           default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                           help="Qwen3-ASR model ID (default: jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame, "
+                                "a Japanese anime/galgame finetune of Qwen/Qwen3-ASR-1.7B that drops "
+                                "~42%% fewer characters on expressive speech; pass Qwen/Qwen3-ASR-1.7B "
+                                "for general-purpose or non-Japanese audio)")
     qwen_model_group.add_argument("--qwen-device", type=str, default="auto",
                            choices=["auto", "cuda", "cpu"],
                            help="Device to use (default: auto)")
@@ -629,6 +640,12 @@ def parse_arguments():
                                 "Overrides the sensitivity preset (conservative 6 / balanced 5 / "
                                 "aggressive 4). The binding cap on subtitle length — lower = shorter, "
                                 "more granular subtitles.")
+    qwen_audio_group.add_argument("--qwen-coverage-rescue", dest="qwen_coverage_rescue",
+                           action="store_true", default=True,
+                           help="Recover acoustically active regions missed by VAD (default: enabled)")
+    qwen_audio_group.add_argument("--no-qwen-coverage-rescue", dest="qwen_coverage_rescue",
+                           action="store_false",
+                           help="Disable energy-gated VAD coverage rescue")
 
     # ── Qwen3-ASR: Generation ─────────────────────────────────────────────
     qwen_gen_group = parser.add_argument_group("Qwen3-ASR: Generation")
@@ -636,10 +653,36 @@ def parse_arguments():
                            help="Maximum inference batch size (default: 1 for accuracy)")
     qwen_gen_group.add_argument("--qwen-max-tokens", type=int, default=4096,
                            help="Maximum tokens to generate (default: 4096, supports ~10 min audio)")
-    qwen_gen_group.add_argument("--qwen-repetition-penalty", type=float, default=1.1,
-                           help="Repetition penalty (1.0=off, >1.0=penalize repeats; default: 1.1)")
+    qwen_gen_group.add_argument("--qwen-repetition-penalty", type=float, default=1.0,
+                           help="Repetition penalty (1.0=off, >1.0=penalize repeats; default: 1.0 = "
+                                "greedy base pass. Escape-valve 1.1 engages automatically on fallback "
+                                "retries. Set >1 only with --qwen-do-sample for the sampling path.)")
     qwen_gen_group.add_argument("--qwen-max-tokens-per-second", type=float, default=20.0,
                            help="Dynamic token budget per audio second (0=disabled; default: 20.0)")
+    qwen_gen_group.add_argument("--qwen-num-beams", type=int, default=1,
+                           help="Number of beams for beam search decoding (default: 1)")
+    qwen_gen_group.add_argument("--qwen-do-sample", dest="qwen_do_sample",
+                           action="store_true", default=False,
+                           help="Enable sampling during generation (default: disabled)")
+    qwen_gen_group.add_argument("--no-qwen-do-sample", dest="qwen_do_sample",
+                           action="store_false",
+                           help="Disable sampling during generation")
+    qwen_gen_group.add_argument("--qwen-temperature", type=float, default=1.0,
+                           help="Temperature for sampling (default: 1.0)")
+    qwen_gen_group.add_argument("--qwen-context-propagation", dest="qwen_context_propagation",
+                           action="store_true", default=True,
+                           help="Enable cross-scene context propagation (default: enabled)")
+    qwen_gen_group.add_argument("--no-qwen-context-propagation", dest="qwen_context_propagation",
+                           action="store_false",
+                           help="Disable cross-scene context propagation")
+    qwen_gen_group.add_argument("--qwen-no-repeat-ngram-size", type=int, default=0,
+                           help="N-gram size to avoid repeating (0=off; default: 0)")
+    qwen_gen_group.add_argument("--qwen-temperature-fallback", dest="qwen_temperature_fallback",
+                           action="store_true", default=True,
+                           help="Enable temperature fallback retry on degenerate output (default: enabled)")
+    qwen_gen_group.add_argument("--no-qwen-temperature-fallback", dest="qwen_temperature_fallback",
+                           action="store_false",
+                           help="Disable temperature fallback retry on degenerate output")
 
     # ── Qwen3-ASR: Alignment ─────────────────────────────────────────────
     qwen_align_group = parser.add_argument_group("Qwen3-ASR: Alignment")
@@ -866,6 +909,65 @@ def apply_vtt_conversion(srt_path: str, output_format: str) -> None:
             logger.info(f"Removed SRT (--output-format vtt): {srt.name}")
     except Exception as e:
         logger.warning(f"VTT conversion failed for {srt}: {e}")
+
+
+def release_translation_vram(args) -> None:
+    """Evict the translation LLM from VRAM after translating.
+
+    Only meaningful for the ``ollama`` provider — cloud providers hold no local
+    memory, and the deprecated ``local`` provider manages its own.
+
+    Asks the server what is actually resident rather than guessing a name.
+    Guessing was wrong twice over: the old call site fell back to ``gemma3:12b``
+    (a model that may not even be installed, so the unload errored out), and
+    even a correct ``--translate-model`` is not what gets loaded —
+    ``OllamaManager._ensure_optimized_variant()`` routes translation through a
+    ``whisperjav-<hash>`` variant carrying the tuned sampling parameters, so
+    unloading the base name left the variant resident until Ollama's ~5 minute
+    idle timeout.
+
+    That timeout is the reason this matters. The ASR model is deliberately kept
+    loaded across files, so a 4.6 GB LLM sitting in VRAM alongside it overflows
+    an 8 GB card into shared memory and the next file transcribes at a fraction
+    of the speed.
+
+    Models belonging to another session are reported but never evicted.
+    Best-effort throughout: a failure here must not fail the run.
+    """
+    if getattr(args, 'translate_provider', None) != 'ollama':
+        return
+    try:
+        from whisperjav.translate.ollama_manager import OllamaManager
+        from whisperjav.translate.providers import PROVIDER_CONFIGS
+        mgr = OllamaManager(base_url=getattr(args, 'ollama_url', None))
+        configured = (getattr(args, 'translate_model', None)
+                      or PROVIDER_CONFIGS['ollama']['model'])
+        resident = mgr.list_running_models()
+        # Ours: the tuned variant (unambiguous by prefix) and the configured
+        # base model, in case variant creation fell through to it.
+        ours, theirs = [], []
+        for entry in resident:
+            name = entry.get('name') or entry.get('model') or ''
+            if not name:
+                continue
+            if name.startswith('whisperjav-') or name == configured:
+                ours.append(name)
+            else:
+                theirs.append(name)
+        for name in ours:
+            if mgr.unload_model(name):
+                print(f"[OLLAMA] Model {name} unloaded from VRAM")
+        if not resident:
+            logger.debug("No Ollama models resident; nothing to unload")
+        elif not ours:
+            # Don't fail silently: VRAM is still occupied and the user is about
+            # to wonder why the next file is slow.
+            print(f"[OLLAMA] Nothing of ours was resident. Still loaded: "
+                  f"{', '.join(theirs)}")
+        elif theirs:
+            logger.debug(f"Left other sessions' models loaded: {theirs}")
+    except Exception as e:
+        logger.debug(f"Ollama VRAM unload skipped: {e}")
 
 
 def cleanup_temp_directory(temp_dir: str):
@@ -1247,14 +1349,16 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
             # Speech segmentation / VAD
             "speech_segmenter": _qwen_segmenter,
             "segmenter_config": _resolved_segmenter_config or None,
+            "coverage_rescue": getattr(args, 'qwen_coverage_rescue', True),
             # Adaptive Step-Down
             "stepdown_enabled": getattr(args, 'qwen_stepdown', True),
             # v1.9.0: Phase-8 nonverbal single-token line filter (default on)
             "drop_nonverbal_lines": getattr(args, 'qwen_drop_nonverbal_lines', True),
             # Generator backend selection (v1.8.6+)
             "generator_backend": getattr(args, 'qwen_generator', 'qwen3'),
+            "qwen_vllm_url": getattr(args, 'qwen_vllm_url', 'http://localhost:8000/v1'),
             # Qwen ASR
-            "model_id": getattr(args, 'qwen_model_id', 'Qwen/Qwen3-ASR-1.7B'),
+            "model_id": getattr(args, 'qwen_model_id', 'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame'),
             "device": getattr(args, 'qwen_device', 'auto'),
             "dtype": getattr(args, 'qwen_dtype', 'auto'),
             "batch_size": getattr(args, 'qwen_batch_size', 1),
@@ -1278,8 +1382,19 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
             # Assembly text cleaner
             "assembly_cleaner": getattr(args, 'qwen_assembly_cleaner', True),
             # Generation safety controls
-            "repetition_penalty": getattr(args, 'qwen_repetition_penalty', 1.1),
+            # Conservative-hybrid (v1.9.0): 1.0 = greedy base pass (Qwen3-ASR
+            # official recipe). Escape-valve penalties engage only on fallback
+            # retries inside _decode_with_fallback(). Set >1 only when opting
+            # into the sampling path (--qwen-do-sample).
+            "repetition_penalty": getattr(args, 'qwen_repetition_penalty', 1.0),
             "max_tokens_per_audio_second": getattr(args, 'qwen_max_tokens_per_second', 20.0),
+            # Decoding and quality options (v1.9.0)
+            "qwen_num_beams": getattr(args, 'qwen_num_beams', 1),
+            "qwen_do_sample": getattr(args, 'qwen_do_sample', False),
+            "qwen_temperature": getattr(args, 'qwen_temperature', 1.0),
+            "qwen_context_propagation": getattr(args, 'qwen_context_propagation', True),
+            "qwen_no_repeat_ngram_size": getattr(args, 'qwen_no_repeat_ngram_size', 0),
+            "qwen_temperature_fallback": getattr(args, 'qwen_temperature_fallback', True),
         }
         # Pipeline-owned defaults: only forward when user explicitly sets a value
         _scene_min = getattr(args, 'qwen_scene_min_duration', None)
@@ -1460,6 +1575,13 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
                     except Exception as e:
                         logger.error(f"Translation failed: {e}")
                         # Don't re-raise - continue with next file
+                    finally:
+                        # Free the LLM before the next file's ASR pass. Translation
+                        # runs per-file here while the ASR model stays loaded, so
+                        # leaving 4.6 GB of LLM resident overflows an 8 GB card.
+                        # In the finally block because a failed translation leaves
+                        # the model loaded just the same.
+                        release_translation_vram(args)
 
                 # VTT conversion (if requested via --output-format)
                 output_format = getattr(args, 'output_format', 'srt')
@@ -1684,6 +1806,10 @@ def process_files_async(media_files: List[Dict], args: argparse.Namespace, resol
                             except Exception as e:
                                 logger.error(f"Translation failed: {e}")
                                 # Don't re-raise - continue with next file
+                            finally:
+                                # Free the LLM before the next file's ASR pass —
+                                # same reasoning as the sync path above.
+                                release_translation_vram(args)
 
                         # VTT conversion (if requested via --output-format)
                         output_format = getattr(args, 'output_format', 'srt')
@@ -2642,15 +2768,7 @@ def main():
                 print("="*50)
 
                 # Unload Ollama model from VRAM after all files are translated
-                if args.translate_provider == 'ollama':
-                    try:
-                        from whisperjav.translate.ollama_manager import OllamaManager
-                        _mgr = OllamaManager()
-                        _model = args.translate_model or 'gemma3:12b'
-                        if _mgr.unload_model(_model):
-                            print(f"[OLLAMA] Model {_model} unloaded from VRAM")
-                    except Exception:
-                        pass  # Best-effort — don't fail the run
+                release_translation_vram(args)
 
             # ============================================================
             # VTT CONVERSION: Convert SRT outputs if requested

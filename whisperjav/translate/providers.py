@@ -56,7 +56,17 @@ PROVIDER_CONFIGS = {
     },
     'ollama': {
         'pysubtrans_name': 'Custom Server',  # Uses OpenAI-compatible /v1/chat/completions
-        'model': 'gemma3:12b',         # Default; OllamaManager.recommend_model() overrides at runtime
+        # Uncensored by default. JAV dialogue is explicit by definition, so a
+        # safety-aligned model does not just score worse — it writes refusal
+        # boilerplate into the subtitle track (see whisperjav/translate/refusal.py).
+        # This pick is Qwen2.5-7B-Instruct abliterated at 4.7 GB Q4_K_M, so it
+        # fits an 8 GB card alongside an 8K context. Chosen over the
+        # Hunyuan-MT-1.5 translation specialist because that model desynced
+        # cues on a JAV probe and resisted the glossary's register — see the
+        # 8 GB entry in _UNCENSORED_LADDER (ollama_manager.py) for the measured
+        # comparison. OllamaManager.recommend_model() overrides this at runtime
+        # to match detected VRAM.
+        'model': 'huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M',
         'env_var': None,               # No API key needed
         'server_address': 'http://localhost:11434',
         'endpoint': '/v1/chat/completions',

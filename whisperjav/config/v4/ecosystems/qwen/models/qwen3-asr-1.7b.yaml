@@ -13,17 +13,26 @@ kind: Model
 metadata:
   name: qwen3-asr-1.7b
   ecosystem: qwen
-  displayName: "Qwen3-ASR 1.7B"
+  displayName: "Qwen3-ASR 1.7B (JA Anime/Galgame)"
   description: |
     Qwen3-ASR 1.7B is a multilingual automatic speech recognition model
     that supports automatic language detection and optional ForcedAligner
     for precise word-level timestamps.
-  version: "1.0.0"
+
+    This profile loads jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame, a full
+    finetune of the base model on litagin/Galgame_Speech_ASR_16kHz. It
+    drops ~42% fewer characters than the base model on expressive
+    Japanese voice content (deletion rate 0.0418 -> 0.0242), which is the
+    failure mode that costs whole lines of dialogue. Set spec.model.id
+    back to "Qwen/Qwen3-ASR-1.7B" for general-purpose Japanese or
+    non-Japanese audio.
+  version: "1.1.0"
   tags:
     - qwen
     - multilingual
     - word-timestamps
     - japanese
+    - anime-galgame-finetune
     - recommended
 
 provider: qwen
@@ -33,7 +42,23 @@ provider: qwen
 # =============================================================================
 spec:
   # --- Model Loading ---
-  model.id: "Qwen/Qwen3-ASR-1.7B"
+  # Japanese galgame/anime-domain full finetune of Qwen/Qwen3-ASR-1.7B, trained on
+  # litagin/Galgame_Speech_ASR_16kHz (the corpus behind litagin/anime-whisper).
+  # Chosen for RECALL: on the author's fixed 800-clip benchmark it cuts the deletion
+  # rate from 0.0418 to 0.0242 (-42%), with overall CER 0.1437 -> 0.1285. Dropped
+  # speech is unrecoverable, whereas the extra insertions this costs (0.0169 ->
+  # 0.0231) are cleaned downstream by repetition_cleaner / hallucination_remover.
+  #
+  # Trade-off, per the author's own card: JSUT (0.0948 -> 0.0998) and Common Voice
+  # (0.1269 -> 0.1312) regress slightly, so this is a galgame/anime-domain win rather
+  # than a general-Japanese upgrade. For clean read speech, set this back to
+  # "Qwen/Qwen3-ASR-1.7B".
+  #
+  # Drop-in safe: config.json is byte-identical to the base, generation_config.json
+  # matches (greedy, do_sample=false), and it ships the full tokenizer/processor set.
+  # It omits the tied lm_head.weight (707 tensors vs 708); transformers re-ties it to
+  # embed_tokens on load because thinker_config.text_config.tie_word_embeddings=true.
+  model.id: "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
   model.device: auto
   model.dtype: bfloat16
   model.max_inference_batch_size: 1  # batch_size=1 for accuracy
@@ -68,9 +93,23 @@ presets:
     {}
 
   aggressive:
-    # Higher throughput: larger batch, extended tokens for long audio
-    model.max_inference_batch_size: 16
-    model.max_new_tokens: 8192
+    # Higher throughput, but batch is capped at 2 rather than 16 -- 16 cannot run on
+    # an 8 GiB card.  VRAM accounting, measured on this box (RTX 4060 Laptop, 8188 MiB):
+    #   ASR weights (2.038B params, BF16)      3.796 GiB
+    #   ForcedAligner-0.6B weights (BF16)      1.709 GiB   (resident at the same time)
+    #   ---------------------------------------------
+    #   resident before any decoding           5.506 GiB
+    # KV cache costs 114,688 B/token = 0.1094 MiB/token
+    # (2 [K,V] x 28 layers x 8 KV heads x 128 head_dim x 2 B BF16).  With VRAM cleared
+    # (~7.6 GiB usable) and ~0.35 GiB of CUDA context, roughly 1.7 GiB is left for KV
+    # plus encoder activations, so at 4096 generated tokens:
+    #   batch 1  -> 0.438 GiB   comfortable
+    #   batch 2  -> 0.875 GiB   fits, leaves room for activations
+    #   batch 4  -> 1.750 GiB   exhausts headroom, no room for activations
+    #   batch 16 -> 7.001 GiB   OOM before the first token
+    # max_new_tokens stays at 4096 for the same reason: 8192 doubles worst-case KV.
+    model.max_inference_batch_size: 2
+    model.max_new_tokens: 4096
 
 # =============================================================================
 # GUI Hints
@@ -107,18 +146,20 @@ gui:
   model.max_inference_batch_size:
     widget: spinner
     label: "Batch Size"
-    description: "Maximum inference batch size"
+    description: "Maximum inference batch size. On an 8 GiB card keep this at 1-2: the ASR and ForcedAligner weights already occupy 5.5 GiB, and each batch slot costs ~0.44 GiB of KV cache at 4096 tokens."
     min: 1
-    max: 64
+    max: 8
     step: 1
     group: model
 
   model.max_new_tokens:
     widget: spinner
     label: "Max Tokens"
-    description: "Maximum new tokens per utterance"
+    description: "Maximum new tokens per utterance (4096 covers ~10 min of audio)"
     min: 64
-    max: 1024
+    # Was 1024, which could not even represent the spec default of 4096 -- the GUI
+    # clamped the value and silently truncated long scenes.
+    max: 8192
     step: 64
     group: model
 

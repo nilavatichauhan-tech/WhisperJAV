@@ -84,7 +84,7 @@ class EnsembleOrchestrator:
         media_info: Dict,
         pass1_config: Dict[str, Any],
         pass2_config: Optional[Dict[str, Any]] = None,
-        merge_strategy: str = 'pass1_primary'
+        merge_strategy: str = 'pass2_primary'
     ) -> Dict:
         """Process a single file by delegating to batch processing."""
         results = self.process_batch(
@@ -102,7 +102,7 @@ class EnsembleOrchestrator:
         media_files: List[Dict],
         pass1_config: Dict[str, Any],
         pass2_config: Optional[Dict[str, Any]] = None,
-        merge_strategy: str = 'pass1_primary'
+        merge_strategy: str = 'pass2_primary'
     ) -> List[Dict]:
         if not media_files:
             return []

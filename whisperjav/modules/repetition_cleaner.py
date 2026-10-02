@@ -44,6 +44,8 @@ class RepetitionCleaner:
 
         self.threshold = constants.DEFAULT_THRESHOLD
 
+        self.protected_patterns = []
+
 
 
         # This is the final, curated list of patterns.
@@ -229,212 +231,81 @@ class RepetitionCleaner:
 
         return text, False
 
-
-
-
-
-
-
     def _is_all_repetition(self, text: str) -> bool:
-
         """
-
         Check if text consists almost entirely of repetitive patterns.
-
         This is now more robust to handle the various long-line examples.
-
         """
-
         # More than 90% of the string is a single character (ignoring punctuation)
-
         stripped_text = regex.sub(r'[\p{P}\p{Z}]', '', text)
-
         if len(stripped_text) > 10:
-
             most_common_char_count = Counter(stripped_text).most_common(1)[0][1]
-
             if most_common_char_count / len(stripped_text) > 0.9:
-
                 return True
-
         
-
         # Check for long sequences of a short phrase + separator (e.g., "あ、あ、あ、")
-
         if regex.match(r'^((?:.{1,5}?)[、,!\s!?・]){5,}$', text):
-
             return True
-
             
-
         # Check for long sequences of a short multi-char word (e.g., "ハッハッハッ")
-
         if regex.match(r'^((?:.{2,5}?))\1{3,}$', text):
-
             return True
 
-
-
         # Check for long vowel extensions
-
         if regex.match(r'^[ぁ-んァ-ン][〜ー]{10,}$', text):
-
             return True
-
             
-
         return False
-
-
-
-
-
-    def _is_all_repetition(self, text: str) -> bool:
-
-        """Check if text consists only of repetitive patterns"""
-
-        # Check for long sequences of repeated characters
-
-
-
-        '''
-
-
-
-        if regex.match(r'^([ぁ-んァ-ン])\1{20,}$', text):
-
-            return True
-
-            
-
-        # Check for long sequences with separators
-
-        if regex.match('^([ぁ-んァ-ン][、,!！?？]\\s*){10,}$', text):
-
-            return True
-
-            
-
-        # Check for long vowel extensions
-
-        if regex.match(r'^[ぁ-んァ-ン][〜ー]{20,}$', text):
-
-            return True
-
-            
-
-        return False
-
-
-
-        '''
-
-
-
-        return True
-
-
 
     def _validate_modification(self, original: str, modified: str) -> bool:
-
         """
-
         Validates that a modification is reasonable before accepting it.
-
         Prevents aggressive patterns from destroying valid text.
-
         """
-
         # Allow complete removal if the original was identified as all repetition
-
-        '''
-
-
-
         if not modified.strip() and self._is_all_repetition(original):
-
             return True
-
             
-
         # A basic sanity check to prevent erasing content
-
         if not modified or not modified.strip():
-
             logger.warning("VALIDATION FAILED: Modified text is empty")
-
             return False
-
             
-
         # Allow a significant reduction in length only if the original was all repetition
-
         if len(modified) < len(original) * 0.05:  # e.g., less than 5% of original length
-
             if self._is_all_repetition(original):
-
                 return True
-
             logger.warning(f"VALIDATION FAILED: Modified text too short (possible over-reduction)")
-
             return False
-
-        '''
-
             
-
         return True
 
-
-
     def _is_protected_content_enhanced(self, text: str) -> bool:
-
         stripped = text.strip()
-
         
-
-        '''
-
         if stripped in self.constants.LEGITIMATE_REPETITIONS:
-
             return True
-
         if len(stripped) <= 3:
-
             return True
 
-        for pattern in self.protected_patterns:
-
-            if pattern.search(text):
-
-                return True
-
-
+        # If protected_patterns has any compiled regexes, check them
+        if hasattr(self, 'protected_patterns') and self.protected_patterns:
+            for pattern in self.protected_patterns:
+                if pattern.search(text):
+                    return True
 
         # Force-clean override for ultra-long lines with only kana
-
         if len(stripped) > 45:
-
-            has_kanji = bool(regex.search('\\p{Han}', text))
-
+            has_kanji = bool(regex.search(r'\p{Han}', text))
             has_latin = bool(regex.search(r'[a-zA-Z]', text))
-
             if not has_kanji and not has_latin:
-
                 logger.debug("Bypassing protection: very long line without kanji or Latin.")
-
                 return False  # force-clean it
 
-
-
         # Mixed script = likely real content
-
-        has_hira = bool(regex.search('\\p{Hiragana}', text))
-
-        has_kata = bool(regex.search('\\p{Katakana}', text))
-
-        has_kanji = bool(regex.search('\\p{Han}', text))
-
+        has_hira = bool(regex.search(r'\p{Hiragana}', text))
+        has_kata = bool(regex.search(r'\p{Katakana}', text))
+        has_kanji = bool(regex.search(r'\p{Han}', text))
         has_latin = bool(regex.search(r'[a-zA-Z]', text))
 
 
@@ -444,8 +315,6 @@ class RepetitionCleaner:
         if script_count >= 2:
 
             return True
-
-        '''
 
         return False
 

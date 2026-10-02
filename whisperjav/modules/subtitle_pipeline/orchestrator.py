@@ -58,6 +58,49 @@ except ImportError:
     sf = None  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Japanese sentence-ending punctuation (fullwidth and halfwidth)
+_JA_SENTENCE_ENDS = frozenset("。！？!?")
+
+
+def _truncate_at_sentence_boundary(text: str, max_chars: int = 200) -> str:
+    """
+    Take the last ``max_chars`` of *text*, but shift the cut-point to
+    the nearest Japanese sentence boundary so we don't feed a partial
+    word/phrase to the next scene's ASR context.
+
+    Falls back to a raw character slice if no sentence boundary is found
+    within the window.
+
+    Args:
+        text: Full text to truncate from the end.
+        max_chars: Maximum character budget for the returned string.
+
+    Returns:
+        A suffix of *text* that starts at a sentence boundary, or the
+        last *max_chars* characters if no boundary is found.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    # Take the tail
+    tail = text[-max_chars:]
+
+    # Search for the FIRST sentence-end punctuation in the tail — this
+    # gives us the longest complete-sentence suffix.
+    for i, ch in enumerate(tail):
+        if ch in _JA_SENTENCE_ENDS:
+            # Start after the punctuation
+            candidate = tail[i + 1:].lstrip()
+            if candidate:
+                return candidate
+
+    # No sentence boundary found — return raw tail
+    return tail
+
 class DecoupledSubtitlePipeline:
     """
     Model-agnostic subtitle generation pipeline.
@@ -78,6 +121,8 @@ class DecoupledSubtitlePipeline:
         language: str = "ja",
         context: str = "",
         stepdown_config: Optional[StepDownConfig] = None,
+        context_propagation: bool = True,
+        blank_retry_enabled: bool = True,
     ):
         """
         Initialize the pipeline with protocol components.
@@ -95,6 +140,7 @@ class DecoupledSubtitlePipeline:
             stepdown_config: Optional step-down retry config. When enabled
                 and alignment collapses on a scene, the orchestrator re-frames
                 with tighter grouping and retries generation + alignment.
+            context_propagation: Enable cross-scene context propagation.
         """
         self.framer = framer
         self.generator = generator
@@ -105,6 +151,10 @@ class DecoupledSubtitlePipeline:
         self.language = language
         self.context = context
         self.stepdown_config = stepdown_config
+        self.context_propagation = context_propagation
+        self.blank_retry_enabled = blank_retry_enabled
+        self._generation_quality: list[Optional[dict[str, Any]]] = []
+        self._blank_retry_counts: list[int] = []
 
         # Sentinel stats accumulated across all scenes
         self.sentinel_stats: dict[str, Any] = {
@@ -496,11 +546,16 @@ class DecoupledSubtitlePipeline:
             if needs_generation:
                 break
 
-        # Phase 1: Generation
+        # Interleaved Generation and Cleaning (with Context Propagation)
         scene_raw_texts: list[list[str]] = []
+        scene_texts: list[list[str]] = []
+        self._generation_quality = []
+        self._blank_retry_counts = []
 
         if needs_generation:
             self.generator.load()
+
+        current_context = self.context
 
         try:
             for scene_idx in range(n_scenes):
@@ -527,7 +582,7 @@ class DecoupledSubtitlePipeline:
                 # Batch generate for frames without text
                 if gen_indices:
                     try:
-                        gen_contexts = [self.context] * len(gen_audio_paths) if self.context else None
+                        gen_contexts = [current_context] * len(gen_audio_paths) if current_context else None
                         gen_results = self.generator.generate_batch(
                             audio_paths=gen_audio_paths,
                             language=self.language,
@@ -548,7 +603,7 @@ class DecoupledSubtitlePipeline:
                                 result = self.generator.generate(
                                     audio_path=gen_audio_paths[i],
                                     language=self.language,
-                                    context=self.context if self.context else None,
+                                    context=current_context if current_context else None,
                                 )
                                 raw_texts[gen_idx] = result.text
                             except Exception:
@@ -560,9 +615,83 @@ class DecoupledSubtitlePipeline:
                                 )
                                 raw_texts[gen_idx] = ""
 
+                blank_retry_count = 0
+                if self.blank_retry_enabled:
+                    for gen_idx in gen_indices:
+                        frame = frames[gen_idx]
+                        if raw_texts[gen_idx] or not frame.source.startswith("vad"):
+                            continue
+                        try:
+                            retry_result = self.generator.generate(
+                                audio_path=audio_paths[gen_idx],
+                                language=self.language,
+                                context=current_context if current_context else None,
+                                audio_durations=[frame.duration],
+                                retry_blank_output=True,
+                            )
+                            if retry_result.text.strip():
+                                raw_texts[gen_idx] = retry_result.text
+                                blank_retry_count += 1
+                                logger.info(
+                                    "[DecoupledPipeline] Blank retry recovered scene %d frame %d (%d chars)",
+                                    scene_idx,
+                                    gen_idx,
+                                    len(retry_result.text),
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[DecoupledPipeline] Blank retry failed for scene %d frame %d",
+                                scene_idx,
+                                gen_idx,
+                                exc_info=True,
+                            )
+                self._blank_retry_counts.append(blank_retry_count)
+
                 # Replace any remaining None with empty string
                 raw_texts = [t if t is not None else "" for t in raw_texts]
                 scene_raw_texts.append(raw_texts)
+
+                # Clean the raw texts for this scene immediately
+                clean_texts = self.cleaner.clean_batch(raw_texts)
+                scene_texts.append(clean_texts)
+
+                # Save raw and clean text artifacts
+                if self.artifacts_dir:
+                    self._save_artifact(scene_idx, "raw", "\n---\n".join(raw_texts))
+                    self._save_artifact(scene_idx, "clean", "\n---\n".join(clean_texts))
+
+                # Quality gate analysis (v1.9.0): check for degenerate output
+                try:
+                    from whisperjav.modules.subtitle_pipeline.quality_gate import (
+                        analyze_transcription_quality,
+                    )
+                    combined_text = "".join(clean_texts).strip()
+                    scene_dur = scene_durations[scene_idx] if scene_durations else 0.0
+                    qg_analysis = analyze_transcription_quality(
+                        combined_text,
+                        audio_duration_sec=scene_dur,
+                    )
+                    self._generation_quality.append(qg_analysis.to_dict())
+                except Exception as qg_err:
+                    self._generation_quality.append(None)
+                    logger.debug(
+                        "Quality gate analysis failed for scene %d: %s",
+                        scene_idx, qg_err,
+                    )
+
+                # Update context for the next scene if propagation is enabled
+                # v1.9.0: Truncate at Japanese sentence boundaries (。！？) to
+                # avoid feeding half-words to the next scene's ASR context.
+                if self.context_propagation:
+                    clean_scene_text = "".join(clean_texts).strip()
+                    if clean_scene_text:
+                        preceding = _truncate_at_sentence_boundary(
+                            clean_scene_text, max_chars=200,
+                        )
+                        if self.context:
+                            current_context = f"{self.context}\nPrevious: {preceding}"
+                        else:
+                            current_context = f"Previous: {preceding}"
 
                 # Per-scene generation result
                 scene_chars = sum(len(t) for t in raw_texts)
@@ -577,25 +706,10 @@ class DecoupledSubtitlePipeline:
                         scene_idx + 1, n_scenes, scene_chars,
                     )
 
-                # Save raw text artifacts
-                if self.artifacts_dir:
-                    self._save_artifact(scene_idx, "raw", "\n---\n".join(raw_texts))
-
         finally:
             if needs_generation:
                 self.generator.unload()
                 self._safe_cuda_cleanup()
-
-        # Phase 2: Cleaning
-        logger.info("[DecoupledPipeline] Cleaning %d scenes", n_scenes)
-        scene_texts: list[list[str]] = []
-        for scene_idx, raw_texts in enumerate(scene_raw_texts):
-            clean_texts = self.cleaner.clean_batch(raw_texts)
-            scene_texts.append(clean_texts)
-
-            # Save clean text artifacts
-            if self.artifacts_dir:
-                self._save_artifact(scene_idx, "clean", "\n---\n".join(clean_texts))
 
         # Step summary
         total_raw_chars = sum(len(t) for texts in scene_raw_texts for t in texts)
@@ -1030,6 +1144,14 @@ class DecoupledSubtitlePipeline:
                     hardening_sorted=hardening_diag.sorted,
                     vad_regions=vad_regions,
                     frame_timing=frame_timing,
+                    quality_gate=(
+                        {
+                            **(self._generation_quality[scene_idx] or {}),
+                            "blank_retry_recovered": self._blank_retry_counts[scene_idx],
+                        }
+                        if scene_idx < len(self._generation_quality)
+                        else None
+                    ),
                 )
                 diagnostics = asdict(scene_diag)
 

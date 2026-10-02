@@ -96,6 +96,63 @@ def _resolve_model(provider_config: dict, model: Optional[str] = None, settings:
     return provider_config['model']
 
 
+_GLOSSARY_MARKER = "JAV TERMINOLOGY — MANDATORY RENDERINGS"
+
+
+def _load_jav_glossary() -> Optional[str]:
+    """Load the bundled JAV terminology glossary, or None if missing."""
+    try:
+        path = Path(__file__).parent / 'defaults' / 'jav_glossary.txt'
+        return path.read_text(encoding='utf-8').strip() or None
+    except Exception as e:
+        logger.debug(f"JAV glossary unavailable: {e}")
+        return None
+
+
+def _inject_glossary(content: str) -> str:
+    """Append the JAV terminology glossary to an instruction set's
+    ``### instructions`` section.
+
+    Why this is applied here rather than edited into ``defaults/*.txt``:
+    ``get_instruction_content()`` prefers a remote gist and only falls back to
+    the bundled files, so a glossary living in ``pornify.txt`` silently does
+    nothing whenever the gist is reachable. This function sits downstream of
+    every source (gist, cache, bundled), so the glossary applies to all three.
+
+    Why it is needed at all: both bundled tones already say "avoid euphemisms",
+    and measured against hy-mt1.5 that instruction alone was not enough —
+    「中に出して」 came back as "let it happen" (meaning dropped entirely) and
+    「イッちゃう」 as "I am about to reach orgasm". Naming the specific
+    renderings fixed both. A translation-specialist model follows a term list
+    far more reliably than it follows a register adjective.
+
+    The glossary must land *inside* ``### instructions``: PySubtrans splits this
+    file on ``###`` headings, so appending at the end of the file would file the
+    glossary under ``### retry_instructions`` and it would only be seen on a
+    retry.
+    """
+    glossary = _load_jav_glossary()
+    if not glossary:
+        return content
+    if _GLOSSARY_MARKER in content:
+        return content  # already present (e.g. a gist that bundles it)
+
+    lines = content.splitlines()
+    # Locate the ### instructions heading, then the next ### heading after it.
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().lower().startswith('### instructions')), None)
+    if start is None:
+        # No section to extend. Injecting blind risks landing in the wrong
+        # section, and a wrong-section glossary is worse than none.
+        logger.debug("No '### instructions' section; glossary not injected")
+        return content
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].lstrip().startswith('###')), len(lines))
+
+    body = lines[:end] + ['', glossary, ''] + lines[end:]
+    return '\n'.join(body)
+
+
 def _resolve_instruction_file(tone: str = "standard", refresh: bool = False) -> Optional[str]:
     """
     Resolve instruction file path by fetching content and caching to temp file.
@@ -113,6 +170,8 @@ def _resolve_instruction_file(tone: str = "standard", refresh: bool = False) -> 
         logger.debug(f"No instruction content available for tone: {tone}")
         return None
 
+    instruction_content = _inject_glossary(instruction_content)
+
     # Save to temp file
     temp_dir = Path(tempfile.gettempdir()) / 'whisperjav_translate'
     temp_dir.mkdir(exist_ok=True)
@@ -128,18 +187,36 @@ def _build_provider_options(
     tone: str = "standard",
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
-    settings_model_params: Optional[dict] = None
+    settings_model_params: Optional[dict] = None,
+    model: Optional[str] = None,
 ) -> dict:
     """
     Build provider options with tone-aware defaults.
 
-    Precedence: explicit params > settings > tone-aware defaults
+    Precedence: explicit params > settings > curated model sampling > tone defaults
+
+    The curated tier sits above the tone defaults because the values in
+    ``OLLAMA_MODEL_CONFIGS[...]['sampling']`` come from the model authors'
+    own published recommendations, which describe that model better than a
+    single cross-model default can. hy-mt1.5, for instance, publishes
+    ``top_p 0.6``; the tone default is 0.9.
+
+    That mattered concretely: ``OllamaManager._ensure_optimized_variant()``
+    bakes the curated sampling into the ``whisperjav-<hash>`` variant as
+    Modelfile PARAMETERs, but Ollama lets per-request options override a
+    Modelfile, so passing ``top_p 0.9`` here silently defeated the variant's
+    0.6 on every single call. Meanwhile ``top_k`` and ``repeat_penalty`` were
+    never sent at all, so they only survived by accident — via the variant —
+    and were lost on the fallback path where variant creation fails and the
+    base model is used directly. Sending all three explicitly makes the
+    sampling identical on both paths.
 
     Args:
         tone: Translation tone for default selection
         temperature: Explicit temperature override
         top_p: Explicit top_p override
         settings_model_params: Model params from settings file
+        model: Resolved model name, used to look up curated sampling
 
     Returns:
         Dict of provider options
@@ -154,6 +231,24 @@ def _build_provider_options(
 
     result_temp = default_temperature
     result_top_p = default_top_p
+    extra_sampling = {}
+
+    # Curated per-model sampling beats the tone default.
+    if model:
+        try:
+            from whisperjav.translate.ollama_manager import get_sampling_params
+            curated = get_sampling_params(model) or {}
+        except Exception as e:
+            logger.debug(f"No curated sampling for {model}: {e}")
+            curated = {}
+        if curated.get('top_p') is not None:
+            result_top_p = float(curated['top_p'])
+        if curated.get('temperature') is not None:
+            result_temp = float(curated['temperature'])
+        # Forwarded so they do not depend on the tuned variant existing.
+        for key in ('top_k', 'repeat_penalty', 'min_p'):
+            if curated.get(key) is not None:
+                extra_sampling[key] = curated[key]
 
     # Apply settings overrides
     if settings_model_params:
@@ -180,7 +275,8 @@ def _build_provider_options(
 
     return {
         'temperature': result_temp,
-        'top_p': result_top_p
+        'top_p': result_top_p,
+        **extra_sampling,
     }
 
 
@@ -316,7 +412,8 @@ def translate_with_config(
         tone=tone,
         temperature=temperature,
         top_p=top_p,
-        settings_model_params=settings.get('model_params')
+        settings_model_params=settings.get('model_params'),
+        model=resolved_model,
     )
 
     # Generate output path if not specified

@@ -239,6 +239,24 @@ class SileroV6SpeechSegmenter:
         # Group segments using shared grouping logic
         groups = self._group_segments(segments)
 
+        # v1.9.0: Diagnostic logging for segment boundary analysis
+        if segments and len(segments) > 1:
+            gaps = [
+                segments[i].start_sec - segments[i - 1].end_sec
+                for i in range(1, len(segments))
+            ]
+            if gaps:
+                import statistics
+                logger.debug(
+                    "Silero VAD v6.2: %d segments, %d groups | "
+                    "gap stats: min=%.0fms, max=%.0fms, mean=%.0fms, median=%.0fms",
+                    len(segments), len(groups),
+                    min(gaps) * 1000,
+                    max(gaps) * 1000,
+                    statistics.mean(gaps) * 1000,
+                    statistics.median(gaps) * 1000,
+                )
+
         return SegmentationResult(
             segments=segments,
             groups=groups,

@@ -233,4 +233,5 @@ class SceneDiagnostics:
     # speech_start is the refined display start actually used for the subtitle.
     frame_timing: Optional[list] = None
     group_details: Optional[list] = None
+    quality_gate: Optional[dict] = None  # v1.9.0: CompressionAnalysis.to_dict() output
     error: Optional[str] = None

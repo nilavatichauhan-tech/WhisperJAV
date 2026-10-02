@@ -98,6 +98,7 @@ class WhisperSegSpeechSegmenter:
         force_cpu: bool = False,
         num_threads: int = 1,
         model_path: Optional[str] = None,
+        segment_merge_gap_ms: int = 100,  # v1.9.0: merge segments with gaps < this (Japanese mora protection)
         **kwargs,
     ):
         """
@@ -210,6 +211,7 @@ class WhisperSegSpeechSegmenter:
         self.force_cpu = bool(force_cpu)
         self.num_threads = int(num_threads)
         self.model_path = model_path
+        self.segment_merge_gap_ms = int(segment_merge_gap_ms)  # v1.9.0
 
         if chunk_threshold_s is not None:
             self.chunk_threshold_s = float(chunk_threshold_s)
@@ -947,11 +949,47 @@ class WhisperSegSpeechSegmenter:
             segments = self._probs_to_segments_offline(probs, duration_sec)
         else:
             segments = self._probs_to_segments(probs, duration_sec)
+
+        # v1.9.0: Merge segments separated by very short gaps to prevent
+        # mid-word splits in Japanese continuous speech. Runs after whichever
+        # decoder produced the segments, so it applies to both the offline
+        # two-level decoder and the streaming one.
+        if self.segment_merge_gap_ms > 0 and len(segments) > 1:
+            pre_merge_count = len(segments)
+            segments = self._merge_close_segments(segments)
+            merged_count = pre_merge_count - len(segments)
+            if merged_count > 0:
+                logger.debug(
+                    "WhisperSeg: merged %d segment pairs (gap < %dms), "
+                    "%d → %d segments",
+                    merged_count, self.segment_merge_gap_ms,
+                    pre_merge_count, len(segments),
+                )
+
+
         groups = group_segments(
             segments,
             max_group_duration_s=self.max_group_duration_s,
             chunk_threshold_s=self.chunk_threshold_s,
         )
+
+        # v1.9.0: Diagnostic logging for segment boundary analysis
+        if segments and len(segments) > 1:
+            gaps = [
+                segments[i].start_sec - segments[i - 1].end_sec
+                for i in range(1, len(segments))
+            ]
+            if gaps:
+                import statistics
+                logger.debug(
+                    "WhisperSeg: %d segments, %d groups | "
+                    "gap stats: min=%.0fms, max=%.0fms, mean=%.0fms, median=%.0fms",
+                    len(segments), len(groups),
+                    min(gaps) * 1000,
+                    max(gaps) * 1000,
+                    statistics.mean(gaps) * 1000,
+                    statistics.median(gaps) * 1000,
+                )
 
         return SegmentationResult(
             segments=segments,
@@ -961,6 +999,53 @@ class WhisperSegSpeechSegmenter:
             parameters=self._get_parameters(),
             processing_time_sec=time.time() - start_time,
         )
+
+    # ------------------------------------------------------------------
+    # Segment post-processing (v1.9.0)
+    # ------------------------------------------------------------------
+
+    def _merge_close_segments(
+        self,
+        segments: List[SpeechSegment],
+    ) -> List[SpeechSegment]:
+        """Merge adjacent segments separated by very short gaps.
+
+        Japanese continuous speech can cause the VAD to briefly dip below
+        threshold between morae or syllables, producing micro-gaps that
+        split what should be a single utterance. This pass merges segments
+        whose gap is smaller than ``segment_merge_gap_ms``.
+
+        Args:
+            segments: Sorted list of SpeechSegment objects.
+
+        Returns:
+            New list with close segments merged. Confidence is averaged.
+        """
+        if not segments or len(segments) < 2:
+            return segments
+
+        merge_gap_sec = self.segment_merge_gap_ms / 1000.0
+        merged: List[SpeechSegment] = [segments[0]]
+
+        for seg in segments[1:]:
+            prev = merged[-1]
+            gap = seg.start_sec - prev.end_sec
+
+            if gap < merge_gap_sec:
+                # Merge: extend previous segment to cover both
+                avg_conf = (prev.confidence + seg.confidence) / 2.0
+                merged[-1] = SpeechSegment(
+                    start_sec=prev.start_sec,
+                    end_sec=seg.end_sec,
+                    start_sample=prev.start_sample,
+                    end_sample=seg.end_sample,
+                    confidence=avg_conf,
+                    metadata={**(prev.metadata or {}), "merged": True},
+                )
+            else:
+                merged.append(seg)
+
+        return merged
 
     # ------------------------------------------------------------------
     # Audio I/O helpers

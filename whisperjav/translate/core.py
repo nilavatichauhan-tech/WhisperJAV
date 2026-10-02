@@ -6,6 +6,8 @@ import os
 import sys
 from pathlib import Path
 
+from whisperjav.translate import refusal as _refusal
+
 
 def cap_batch_size_for_context(max_batch_size: int, n_ctx: int) -> int:
     """Cap translation batch size to fit within the LLM context window.
@@ -464,6 +466,57 @@ def translate_subtitle(
                 print(f"[TRANSLATE]   WARNING: Could not patch thinking model — "
                       f"translator.client not found", file=sys.stderr)
 
+        # =====================================================================
+        # Whole-batch refusal detection
+        # =====================================================================
+        # A safety-aligned model handed explicit JAV dialogue replies with
+        # boilerplate instead of the numbered translation block. PySubtrans then
+        # reports only "No matches", which reads as a *format* problem and sends
+        # the user off tuning --max-batch-size when the real cause is the model
+        # declining. This wrapper looks at the raw response so the diagnostic can
+        # name the actual failure.
+        #
+        # It observes and never modifies: it reads message content/reasoning,
+        # records a hit, then delegates untouched. That makes it safe to layer
+        # over the thinking-model patch above in either order.
+        _refusal_stats = {'batches': 0, 'labels': {}, 'sample': None}
+        _refusal_client = getattr(translator, 'client', None)
+        if _refusal_client is not None and hasattr(_refusal_client, '_process_api_response'):
+            _prev_process = _refusal_client._process_api_response
+
+            def _refusal_watch_process(content, result, _orig=_prev_process):
+                try:
+                    _texts = []
+                    for _choice in (content or {}).get('choices', []) or []:
+                        _msg = _choice.get('message', {}) or {}
+                        for _field in ('content', 'reasoning', 'reasoning_content'):
+                            _val = _msg.get(_field)
+                            if _val:
+                                _texts.append(str(_val))
+                    _label = _refusal.scan_response_text("\n".join(_texts)) if _texts else None
+                    if _label:
+                        _refusal_stats['batches'] += 1
+                        _refusal_stats['labels'][_label] = _refusal_stats['labels'].get(_label, 0) + 1
+                        if _refusal_stats['sample'] is None:
+                            _refusal_stats['sample'] = " ".join("\n".join(_texts).split())[:200]
+                        print(f"\n[TRANSLATE] *** MODEL REFUSED THIS BATCH "
+                              f"(refusal #{_refusal_stats['batches']}, pattern: {_label}) ***",
+                              file=sys.stderr)
+                        print(f"[TRANSLATE]   The response contains no numbered translations, "
+                              f"only refusal text.", file=sys.stderr)
+                        print(f"[TRANSLATE]   This is a MODEL ALIGNMENT problem, not a batch-size "
+                              f"problem — the model", file=sys.stderr)
+                        print(f"[TRANSLATE]   declined the content. Shrinking batches will not help.",
+                              file=sys.stderr)
+                        if _refusal_stats['batches'] == 1:
+                            print(f"[TRANSLATE]   Response: {_refusal_stats['sample']}", file=sys.stderr)
+                except Exception:
+                    # Diagnostics must never break translation.
+                    pass
+                return _orig(content, result)
+
+            _refusal_client._process_api_response = _refusal_watch_process
+
         # Enable resume mode to skip already-translated batches when resuming
         # This is critical for interrupted translations - without it, the translator
         # will re-translate everything from the beginning even if a .subtrans file exists
@@ -500,7 +553,8 @@ def translate_subtitle(
         # =========================================================================
         # A1: Diagnostic token logging — track batch results and failures
         # =========================================================================
-        _batch_stats = {'total': 0, 'success': 0, 'no_matches': 0, 'errors': 0}
+        _batch_stats = {'total': 0, 'success': 0, 'no_matches': 0, 'errors': 0,
+                        'refused_lines': 0}
 
         def _diagnostic_batch_handler(sender, **kwargs):
             """Track batch translation results for diagnostic summary.
@@ -528,8 +582,18 @@ def translate_subtitle(
                 if provider_config.get('max_tokens'):
                     print(f"[TRANSLATE]   max_tokens was set to: {provider_config['max_tokens']}",
                           file=sys.stderr)
-                print(f"[TRANSLATE]   Consider: smaller --max-batch-size, different model, or cloud provider",
-                      file=sys.stderr)
+                # If the response watcher already identified this as a refusal,
+                # don't send the user off tuning batch size — that advice is
+                # actively wrong for an alignment failure.
+                if _refusal_stats['batches'] > 0:
+                    print(f"[TRANSLATE]   NOTE: {_refusal_stats['batches']} batch(es) so far were "
+                          f"REFUSALS, not format errors.", file=sys.stderr)
+                    print(f"[TRANSLATE]   Switch to an uncensored model instead: "
+                          f"--translate-model huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M",
+                          file=sys.stderr)
+                else:
+                    print(f"[TRANSLATE]   Consider: smaller --max-batch-size, different model, or cloud provider",
+                          file=sys.stderr)
 
         def _diagnostic_error_handler(sender, message=None, **kwargs):
             """Track all translation errors — not just HTTP errors."""
@@ -669,6 +733,43 @@ def translate_subtitle(
                   file=sys.stderr)
             print(f"[TRANSLATE]   All subtitles translated: {'YES' if _all_translated else 'NO'}",
                   file=sys.stderr)
+
+            # =====================================================================
+            # Per-line refusal scan — the silent failure mode
+            # =====================================================================
+            # A model can honour the numbered-batch format and still refuse
+            # individual lines, substituting boilerplate or "[Content omitted]"
+            # for the explicit ones. PySubtrans sees valid markers, accepts the
+            # response, and the refusal text is written into the .srt. Nothing
+            # above this point catches that: any_translated is YES, the batch
+            # counters are clean, and the user only finds out while watching.
+            #
+            # Scanned here rather than after SaveTranslation so the warning lands
+            # with the rest of the run summary, and so it still fires when the
+            # save itself fails.
+            if _refusal_stats['batches'] > 0:
+                print(f"[TRANSLATE]   Whole-batch refusals seen: {_refusal_stats['batches']} "
+                      f"({', '.join(f'{k}={v}' for k, v in sorted(_refusal_stats['labels'].items()))})",
+                      file=sys.stderr)
+            try:
+                _translated_lines = []
+                if hasattr(project, 'subtitles') and project.subtitles:
+                    _translated_lines = getattr(project.subtitles, 'translated', None) or []
+                if _translated_lines:
+                    _report = _refusal.scan(
+                        getattr(_line, 'text', None) for _line in _translated_lines
+                    )
+                    if _report:
+                        for _rline in _refusal.format_report(_report, model=model):
+                            print(_rline, file=sys.stderr)
+                        _batch_stats['refused_lines'] = _report.count
+                    elif debug:
+                        print(f"[TRANSLATE]   Refusal scan: clean "
+                              f"({_report.total_lines} lines checked)", file=sys.stderr)
+            except Exception as _e:
+                # A broken diagnostic must not turn a successful run into a failure.
+                if debug:
+                    print(f"[TRANSLATE]   Refusal scan skipped: {_e}", file=sys.stderr)
 
             # Override success based on ground truth — if TranslateSubtitles()
             # didn't raise but nothing was actually translated, it's a failure.

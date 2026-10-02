@@ -1,6 +1,11 @@
 [
-  { "model": "gemma3:12b",                                            "size": "8.1 GB", "label": "Gemma 3 12B (instruct)",      "rank": 1 },
-  { "model": "qwen2.5:7b-instruct",                                   "size": "4.7 GB", "label": "Qwen2.5-7B Instruct",        "rank": 2 },
-  { "model": "huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M",      "size": "4.7 GB", "label": "Qwen2.5-7B-Abliterated Q4",  "rank": 3 },
-  { "model": "dolphin-llama3:8b-256k-v2.9-q4_K_M",                    "size": "4.8 GB", "label": "Dolphin-Llama3-8B-256K Q4",  "rank": 4 }
+  { "model": "huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M",  "size": "4.7 GB", "label": "Qwen2.5 7B Abliterated Q4 (default: holds cue alignment, follows glossary)", "rank": 1, "uncensored": true,  "min_vram_gb": 8 },
+  { "model": "huihui_ai/hy-mt1.5-abliterated:7b",                "size": "4.6 GB", "label": "Hunyuan-MT-1.5 7B Abliterated (MT specialist; can desync cues)", "rank": 2, "uncensored": true,  "min_vram_gb": 8 },
+  { "model": "huihui_ai/hunyuan-mt-abliterated:latest",          "size": "4.6 GB", "label": "Hunyuan-MT v1 7B Abliterated (fallback for 1.5)",       "rank": 3, "uncensored": true,  "min_vram_gb": 8 },
+  { "model": "huihui_ai/qwen3-abliterated:4b",                   "size": "2.5 GB", "label": "Qwen3 4B Abliterated (4-6 GB cards)",                  "rank": 4, "uncensored": true,  "min_vram_gb": 4 },
+  { "model": "huihui_ai/qwen2.5-abliterate:3b-instruct-q4_K_M",  "size": "1.9 GB", "label": "Qwen2.5 3B Abliterated Q4 (low VRAM / CPU)",           "rank": 5, "uncensored": true,  "min_vram_gb": 0 },
+  { "model": "huihui_ai/qwen2.5-abliterate:14b-instruct-q4_K_M", "size": "9.0 GB", "label": "Qwen2.5 14B Abliterated Q4 (16 GB+ cards)",            "rank": 6, "uncensored": true,  "min_vram_gb": 16 },
+  { "model": "dolphin-llama3:8b-256k-v2.9-q4_K_M",               "size": "4.9 GB", "label": "Dolphin-Llama3 8B 256K Q4 (uncensored, older)",         "rank": 7, "uncensored": true,  "min_vram_gb": 8 },
+  { "model": "qwen2.5:7b-instruct",                              "size": "4.7 GB", "label": "Qwen2.5 7B Instruct - ALIGNED, may refuse explicit",    "rank": 8, "uncensored": false, "min_vram_gb": 8 },
+  { "model": "gemma3:12b",                                       "size": "8.1 GB", "label": "Gemma 3 12B - ALIGNED, may refuse explicit",            "rank": 9, "uncensored": false, "min_vram_gb": 12 }
 ]

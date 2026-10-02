@@ -213,7 +213,15 @@ class QwenASR:
     """
 
     # Default model IDs
-    DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
+    # jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame is a full finetune of
+    # Qwen/Qwen3-ASR-1.7B on litagin/Galgame_Speech_ASR_16kHz.  Same architecture,
+    # same greedy generation_config, same VRAM footprint (2.038B params BF16 =
+    # 3.796 GiB after transformers re-ties lm_head to embed_tokens).  Chosen because
+    # it cuts the deletion rate 0.0418 -> 0.0242 on expressive Japanese speech;
+    # dropped dialogue is unrecoverable, while the extra insertions it introduces are
+    # removed downstream by RepetitionCleaner / HallucinationRemover.
+    # Pass model_id="Qwen/Qwen3-ASR-1.7B" for general-purpose or non-Japanese audio.
+    DEFAULT_MODEL_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     DEFAULT_ALIGNER_ID = "Qwen/Qwen3-ForcedAligner-0.6B"
 
     # Default processing parameters
@@ -230,6 +238,21 @@ class QwenASR:
     # Used for warnings and documentation
     MAX_FORCE_ALIGN_SECONDS = 180  # 3 min limit when using ForcedAligner
     MAX_ASR_SECONDS = 1200  # 20 min limit without ForcedAligner
+
+    # Temperature fallback ladder (mirrors openai-whisper's decode_with_fallback).
+    # The first attempt is always greedy (temperature 0.0, do_sample=False);
+    # each subsequent step enables sampling and raises the temperature to escape
+    # repetition loops. We break on the first non-degenerate result.
+    TEMPERATURE_LADDER: tuple = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
+    # Escape-valve generation settings applied ONLY on fallback retries (after a
+    # greedy decode was already flagged degenerate). These engage the repetition
+    # suppression that the official Qwen3-ASR recipe leaves at defaults (1.0 / 0).
+    # Keeping them off the base pass preserves Qwen's supported greedy regime for
+    # clean speech; engaging them only when the model has already looped gives the
+    # retry a stronger hand without distorting every segment's logits.
+    FALLBACK_REPETITION_PENALTY: float = 1.1
+    FALLBACK_NO_REPEAT_NGRAM_SIZE: int = 4
 
     def __init__(
         self,
@@ -252,6 +275,13 @@ class QwenASR:
         repetition_penalty: float = 1.0,          # 1.0 = off; >1.0 penalizes repeated tokens via HF generation_config
         max_tokens_per_audio_second: float = 0.0,  # 0 = disabled; >0 = dynamic per-scene token budget scaling
         min_tokens_floor: int = 256,               # minimum token budget when dynamic scaling is active
+        # Decoding config (v1.9.0)
+        num_beams: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        # Quality controls (v1.9.0)
+        no_repeat_ngram_size: int = 0,       # 0 = off; >0 = forbid repeated n-grams of this size
+        temperature_fallback: bool = True,   # 2-stage retry: greedy first, then temp=0.4 if degenerate
     ):
         """
         Initialize QwenASR.
@@ -278,6 +308,9 @@ class QwenASR:
                                 - "default": General conversational dialogue
                                 - "high_moan": Adult content with frequent vocalizations
                                 - "narrative": Longer narrative passages
+            num_beams: Number of beams for beam search (default: 1)
+            do_sample: Whether to use sampling during generation (default: False)
+            temperature: Temperature for generation sampling (default: 1.0)
         """
         self.model_id = model_id
         self.device_request = device
@@ -300,6 +333,15 @@ class QwenASR:
         self.repetition_penalty = repetition_penalty
         self.max_tokens_per_audio_second = max_tokens_per_audio_second
         self.min_tokens_floor = min_tokens_floor
+
+        # Decoding config (v1.9.0)
+        self.num_beams = num_beams
+        self.do_sample = do_sample
+        self.temperature = temperature
+
+        # Quality controls (v1.9.0)
+        self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.temperature_fallback = temperature_fallback
 
         # Initialize post-processor (lightweight, no GPU resources)
         self._postprocessor = JapanesePostProcessor() if japanese_postprocess else None
@@ -393,11 +435,8 @@ class QwenASR:
 
     def _apply_generation_config(self) -> None:
         """
-        Apply generation safety controls to the thinker's HF GenerationConfig.
-
-        Sets repetition_penalty on the underlying thinker model's generation_config
-        after model load. This is the standard HuggingFace mechanism — the outer
-        generate() call reads from generation_config when no explicit kwarg is passed.
+        Apply generation config parameters (repetition_penalty, num_beams,
+        do_sample, temperature, early_stopping) to the thinker's HF GenerationConfig.
 
         Access chain (verified):
             self.model.model.thinker.generation_config
@@ -406,26 +445,315 @@ class QwenASR:
             - .thinker → Qwen3ASRThinkerForConditionalGeneration (GenerationMixin)
             - .generation_config → HF GenerationConfig
 
-        Wrapped in try/except: if qwen-asr restructures internals, we log a
-        warning instead of crashing. The penalty is a quality improvement, not
-        a correctness requirement.
-        """
-        if self.repetition_penalty == 1.0:
-            return  # 1.0 = no penalty, nothing to set
+        Conservative-hybrid decoding (v1.9.0):
+            The BASE pass follows Qwen3-ASR's official recipe — greedy
+            (do_sample=False) with repetition_penalty=1.0 and
+            no_repeat_ngram_size=0. When the user has not explicitly opted
+            into sampling, temperature is NOT applied to the config: under
+            greedy decoding temperature is inert, and setting it to the old
+            default of 1.0 was a contradictory no-op that obscured intent.
+            The escape-valve penalties (repetition_penalty>1, n-gram blocking)
+            engage only on fallback retries via _decode_with_fallback(), so
+            clean-speech logits are never distorted.
 
+            If the user explicitly enables do_sample=True, we honor the full
+            sampling configuration (temperature, repetition_penalty, n-gram
+            blocking) as before — this is the opt-in "power user" path.
+
+        Wrapped in try/except: if qwen-asr restructures internals, we log a
+        warning instead of crashing.
+        """
         try:
             gen_config = self.model.model.thinker.generation_config
-            gen_config.repetition_penalty = self.repetition_penalty
+
+            # Apply beam search config (independent of sampling)
+            gen_config.num_beams = self.num_beams
+            if self.num_beams > 1:
+                gen_config.early_stopping = True
+
+            # Sampling / temperature: only meaningful when do_sample=True.
+            # Under greedy decoding (the Qwen3-ASR default and our base pass)
+            # temperature/top_p/top_k are inert — applying them is a no-op that
+            # just obscures intent. Skip them unless the user opted into sampling.
+            gen_config.do_sample = self.do_sample
+            if self.do_sample:
+                gen_config.temperature = self.temperature
+                gen_config.repetition_penalty = self.repetition_penalty
+                if self.no_repeat_ngram_size > 0:
+                    gen_config.no_repeat_ngram_size = self.no_repeat_ngram_size
+            else:
+                # Greedy base pass: follow Qwen3-ASR's official recipe and
+                # leave the repetition/length knobs at their defaults (1.0 / 0).
+                # The escape-valve penalties engage only on fallback retries.
+                gen_config.temperature = 1.0  # inert under greedy; matches Qwen default
+                gen_config.repetition_penalty = 1.0
+                gen_config.no_repeat_ngram_size = 0
+                if self.no_repeat_ngram_size > 0 or self.repetition_penalty != 1.0:
+                    logger.debug(
+                        "  Conservative-hybrid: repetition_penalty=%.2f and "
+                        "no_repeat_ngram_size=%d are inert under greedy base pass; "
+                        "they engage only on fallback retries (do_sample=False).",
+                        self.repetition_penalty, self.no_repeat_ngram_size,
+                    )
+
             logger.info(
-                "  Generation safety: repetition_penalty=%.2f applied to thinker",
-                self.repetition_penalty,
+                "  Generation config applied to thinker: repetition_penalty=%.2f, "
+                "no_repeat_ngram_size=%d, num_beams=%d, do_sample=%s, temperature=%.2f",
+                gen_config.repetition_penalty,
+                getattr(gen_config, "no_repeat_ngram_size", 0),
+                self.num_beams,
+                self.do_sample,
+                gen_config.temperature,
             )
         except AttributeError as e:
             logger.warning(
-                "Could not apply repetition_penalty — qwen-asr model structure "
-                "may have changed: %s. Generation will proceed without penalty.",
+                "Could not apply generation config — qwen-asr model structure "
+                "may have changed: %s. Generation will proceed with defaults.",
                 e,
             )
+
+    @staticmethod
+    def _is_degenerate_output(
+        text: str,
+        audio_duration_sec: float = 0.0,
+        avg_logprob: Optional[float] = None,
+        no_speech_prob: Optional[float] = None,
+    ) -> bool:
+        """
+        Check if ASR output shows signs of hallucination or degenerate looping.
+
+        Used by the temperature fallback mechanism to decide whether to retry
+        transcription at a higher temperature. Delegates to the quality_gate
+        module for the actual metrics.
+
+        The two optional generation-score signals (avg_logprob, no_speech_prob)
+        are forwarded when the caller has them (e.g. the direct-generate /
+        speculative path). When the quality gate's silence override fires
+        (no_speech_prob >= threshold) this returns False — there is no point
+        retrying a genuinely silent segment.
+
+        Args:
+            text: Raw transcription text from ASR.
+            audio_duration_sec: Duration of the source audio in seconds.
+            avg_logprob: Optional mean per-token log-probability from
+                generate(output_scores=True). Strengthens the gate.
+            no_speech_prob: Optional model-reported no-speech probability.
+                When high, suppresses the degenerate flag (silence override).
+
+        Returns:
+            True if the text appears degenerate and should be retried.
+        """
+        if not text or not text.strip():
+            return False  # Empty text is not degenerate — it's silence
+
+        try:
+            from whisperjav.modules.subtitle_pipeline.quality_gate import (
+                analyze_transcription_quality,
+                QualityGateConfig,
+            )
+            analysis = analyze_transcription_quality(
+                text,
+                audio_duration_sec=audio_duration_sec,
+                config=QualityGateConfig(enabled=True),
+                avg_logprob=avg_logprob,
+                no_speech_prob=no_speech_prob,
+            )
+            return analysis.is_degenerate
+        except ImportError:
+            # Fallback: simple compression ratio check if quality_gate unavailable
+            import zlib
+            raw = text.encode("utf-8")
+            if len(raw) < 10:
+                return False
+            ratio = len(raw) / len(zlib.compress(raw, level=6))
+            return ratio > 2.4
+
+    def _decode_with_fallback(
+        self,
+        # qwen-asr AudioLike: a str path, or (np.ndarray, sample_rate) for the
+        # v1.9.0 pathless in-memory frame audio. Forwarded to transcribe() as-is.
+        audio: Union[str, tuple],
+        context: str,
+        language: Optional[str],
+        return_time_stamps: bool,
+        scene_token_limit: int,
+        audio_duration_sec: float,
+        retry_blank_output: bool = False,
+    ) -> tuple:
+        """
+        Run Qwen3-ASR transcription with the full Whisper-style temperature
+        fallback ladder (Change 2).
+
+        Mirrors openai-whisper's ``decode_with_fallback``: the first attempt
+        is greedy (temperature 0.0, ``do_sample=False``) following Qwen3-ASR's
+        official recipe; each subsequent step enables sampling and raises the
+        temperature through ``(0.2, 0.4, 0.6, 0.8, 1.0)`` to escape repetition
+        loops. On fallback steps (temperature > 0) the escape-valve penalties
+        (``FALLBACK_REPETITION_PENALTY``, ``FALLBACK_NO_REPEAT_NGRAM_SIZE``)
+        engage to give the retry a stronger hand. We break on the first
+        non-degenerate result; if every step is degenerate we keep the final
+        attempt (highest temperature — most likely to have broken the loop).
+
+        Generation config (temperature / do_sample / repetition_penalty /
+        no_repeat_ngram_size) is overridden per step and restored to the
+        pre-call state in a ``finally`` block. ``max_new_tokens`` is set to
+        ``scene_token_limit`` per attempt and restored likewise.
+
+        When ``temperature_fallback`` is disabled, this collapses to a single
+        greedy pass (preserving the old non-fallback behavior).
+
+        Args:
+            audio: Audio to decode — a str path, or an (np.ndarray, sample_rate)
+                tuple for in-memory frame audio. Passed to qwen-asr
+                ``transcribe()`` unchanged.
+            context: Context string for ASR biasing.
+            language: Normalized qwen-asr language name (e.g. "Japanese")
+                or None for auto-detect.
+            return_time_stamps: Whether to request ForcedAligner timestamps.
+            scene_token_limit: Dynamic ``max_new_tokens`` for this scene.
+            audio_duration_sec: Audio duration in seconds (for the quality gate).
+
+        Returns:
+            Tuple ``(text, result, fallback_used, temperature_used)``:
+                text: Stripped transcription text (may be empty for silence).
+                result: The ``ASRTranscription`` object from the accepted
+                    attempt, or None if ``transcribe`` returned nothing.
+                fallback_used: True if a non-greedy temperature was accepted.
+                temperature_used: The temperature that produced the accepted
+                    text (0.0 for the greedy base pass).
+        """
+        # --- Fallback disabled: single greedy pass (backward-compatible). ---
+        if not self.temperature_fallback:
+            original_max_tokens = self.model.max_new_tokens
+            self.model.max_new_tokens = scene_token_limit
+            try:
+                results = self.model.transcribe(
+                    audio=[audio], context=[context], language=language,
+                    return_time_stamps=return_time_stamps,
+                )
+            finally:
+                self.model.max_new_tokens = original_max_tokens
+            result = results[0] if results else None
+            text = getattr(result, "text", "").strip() if result else ""
+            return text, result, False, 0.0
+
+        # --- Snapshot generation config so we can restore it regardless of outcome. ---
+        gen_config = None
+        snapshot: dict = {}
+        try:
+            gen_config = self.model.model.thinker.generation_config
+            snapshot = {
+                "temperature": gen_config.temperature,
+                "do_sample": gen_config.do_sample,
+                "repetition_penalty": gen_config.repetition_penalty,
+                "no_repeat_ngram_size": getattr(gen_config, "no_repeat_ngram_size", 0),
+            }
+        except AttributeError:
+            # No thinker.generation_config accessible — fall back to single-pass.
+            gen_config = None
+
+        # Snapshot max_new_tokens so the dynamic per-scene budget can be applied
+        # and restored. Guard against wrappers that don't expose this attribute
+        # (e.g. test mocks): in that case we skip the token-budget swap entirely.
+        original_max_tokens = getattr(self.model, "max_new_tokens", None)
+        has_token_budget = original_max_tokens is not None
+        text = ""
+        result = None
+        fallback_used = False
+        temperature_used = 0.0
+
+        try:
+            for step_idx, temperature in enumerate(self.TEMPERATURE_LADDER):
+                is_fallback_step = step_idx > 0
+
+                # Configure this ladder step on the thinker's GenerationConfig.
+                if gen_config is not None:
+                    if temperature == 0.0:
+                        # Greedy base pass — Qwen3-ASR official recipe.
+                        gen_config.do_sample = False
+                        gen_config.temperature = 1.0  # inert under greedy
+                        gen_config.repetition_penalty = 1.0
+                        gen_config.no_repeat_ngram_size = 0
+                    else:
+                        # Sampling fallback: raise temperature + engage escape valves.
+                        gen_config.do_sample = True
+                        gen_config.temperature = temperature
+                        gen_config.repetition_penalty = self.FALLBACK_REPETITION_PENALTY
+                        gen_config.no_repeat_ngram_size = self.FALLBACK_NO_REPEAT_NGRAM_SIZE
+
+                # Run this attempt with the dynamic token budget.
+                self.model.max_new_tokens = scene_token_limit
+                attempt_results = self.model.transcribe(
+                    audio=[audio], context=[context], language=language,
+                    return_time_stamps=return_time_stamps,
+                )
+                attempt_result = attempt_results[0] if attempt_results else None
+                attempt_text = (
+                    getattr(attempt_result, "text", "").strip()
+                    if attempt_result else ""
+                )
+
+                # Empty text normally means silence. Coverage-first callers can
+                # explicitly retry a VAD-positive frame through the ladder.
+                if not attempt_text:
+                    text = attempt_text
+                    result = attempt_result
+                    fallback_used = is_fallback_step
+                    temperature_used = temperature
+                    if not retry_blank_output or step_idx == len(self.TEMPERATURE_LADDER) - 1:
+                        break
+                    logger.warning(
+                        "  Blank output on VAD-positive audio at temperature=%.1f, escalating...",
+                        temperature,
+                    )
+                    continue
+
+                degenerate = self._is_degenerate_output(attempt_text, audio_duration_sec)
+                if not degenerate:
+                    text = attempt_text
+                    result = attempt_result
+                    fallback_used = is_fallback_step
+                    temperature_used = temperature
+                    if is_fallback_step:
+                        logger.info(
+                            "  Fallback succeeded at temperature=%.1f (%d chars)",
+                            temperature, len(attempt_text),
+                        )
+                    break
+
+                # Degenerate — keep as the current best and escalate.
+                text = attempt_text
+                result = attempt_result
+                fallback_used = is_fallback_step
+                temperature_used = temperature
+                if step_idx < len(self.TEMPERATURE_LADDER) - 1:
+                    logger.warning(
+                        "  Degenerate output at temperature=%.1f (%d chars), escalating...",
+                        temperature, len(attempt_text),
+                    )
+                else:
+                    logger.warning(
+                        "  Degenerate output at temperature=%.1f (%d chars) — "
+                        "end of ladder, keeping final attempt.",
+                        temperature, len(attempt_text),
+                    )
+                    if retry_blank_output:
+                        text = ""
+                        result = None
+                        fallback_used = False
+                        temperature_used = 0.0
+        finally:
+            # Restore generation config + token budget regardless of outcome.
+            if gen_config is not None:
+                for key, val in snapshot.items():
+                    try:
+                        setattr(gen_config, key, val)
+                    except Exception:
+                        pass
+            if self.model is not None:
+                self.model.max_new_tokens = original_max_tokens
+
+        return text, result, fallback_used, temperature_used
 
     def _compute_dynamic_token_limit(self, audio_duration_sec: float) -> int:
         """
@@ -724,30 +1052,26 @@ class QwenASR:
 
         # Dynamic token budget (v1.8.9+): scale max_new_tokens to audio duration
         scene_token_limit = self._compute_dynamic_token_limit(audio_duration)
-        original_max_tokens = None
-        if self.model is not None and scene_token_limit != self.max_new_tokens:
-            original_max_tokens = self.model.max_new_tokens
-            self.model.max_new_tokens = scene_token_limit
-            logger.debug(
-                "Dynamic token budget: %d tokens for %.1fs audio (%.1f tok/s)",
-                scene_token_limit, audio_duration, self.max_tokens_per_audio_second,
+        logger.debug(
+            "Dynamic token budget: %d tokens for %.1fs audio (%.1f tok/s)",
+            scene_token_limit, audio_duration, self.max_tokens_per_audio_second,
+        )
+
+        # If aligner is disabled, fall back to simple transcription
+        if not self.use_aligner:
+            result = self._transcribe_without_aligner(
+                audio_path, effective_context, audio_duration, scene_token_limit
             )
+            process_time = time.time() - start_time
+            logger.debug(f"Transcription (no aligner) complete in {process_time:.1f}s")
+            if progress_callback:
+                progress_callback(1.0, "Transcription complete")
+            return result
 
-        try:
-            # If aligner is disabled, fall back to simple transcription
-            if not self.use_aligner:
-                result = self._transcribe_without_aligner(audio_path, effective_context)
-                process_time = time.time() - start_time
-                logger.debug(f"Transcription (no aligner) complete in {process_time:.1f}s")
-                if progress_callback:
-                    progress_callback(1.0, "Transcription complete")
-                return result
-
-            # With aligner: use transcribe_any for word-to-sentence regrouping
-            result = self._transcribe_with_regrouping(audio_path, progress_callback, artifacts_dir, effective_context)
-        finally:
-            if original_max_tokens is not None and self.model is not None:
-                self.model.max_new_tokens = original_max_tokens
+        # With aligner: use transcribe_any for word-to-sentence regrouping
+        result = self._transcribe_with_regrouping(
+            audio_path, progress_callback, artifacts_dir, effective_context, audio_duration, scene_token_limit
+        )
 
         process_time = time.time() - start_time
         segment_count = len(result.segments) if result.segments else 0
@@ -778,6 +1102,8 @@ class QwenASR:
         progress_callback: Optional[Callable[[float, str], None]] = None,
         artifacts_dir: Optional[Union[str, Path]] = None,
         effective_context: str = "",
+        audio_duration: Optional[float] = None,
+        scene_token_limit: Optional[int] = None,
     ) -> stable_whisper.WhisperResult:
         """
         Transcribe with ForcedAligner and stable-ts regrouping.
@@ -819,41 +1145,51 @@ class QwenASR:
             """
             try:
                 # DIAGNOSTIC: Log inference call parameters
-                logger.info(f"[DIAG] qwen_inference() called")
-                logger.info(f"[DIAG]   audio: {audio}")
-                logger.info(f"[DIAG]   model.max_new_tokens: {qwen_model.max_new_tokens}")
-                logger.info(f"[DIAG]   model.max_inference_batch_size: {qwen_model.max_inference_batch_size}")
-                logger.info(f"[DIAG]   context: {repr(qwen_context[:50]) + '...' if qwen_context else '(none)'}")
-                logger.info(f"[DIAG]   language: {qwen_language}")
+                logger.debug(f"[DIAG] qwen_inference() called")
+                logger.debug(f"[DIAG]   audio: {audio}")
+                if qwen_model is not None:
+                    logger.debug(f"[DIAG]   model.max_new_tokens: {qwen_model.max_new_tokens}")
+                    logger.debug(f"[DIAG]   model.max_inference_batch_size: {qwen_model.max_inference_batch_size}")
+                logger.debug(f"[DIAG]   context: {repr(qwen_context[:50]) + '...' if qwen_context else '(none)'}")
+                logger.debug(f"[DIAG]   language: {qwen_language}")
 
-                # Call qwen-asr with timestamps enabled
-                results = qwen_model.transcribe(
+                # --- Full temperature fallback ladder (v1.9.0, Change 2) ---
+                # The regrouping path previously had NO fallback — coupled-mode
+                # users got no retry on degenerate output. _decode_with_fallback()
+                # runs the Whisper-style ladder (0.0→0.2→0.4→0.6→0.8→1.0) with the
+                # ForcedAligner timestamps preserved (return_time_stamps=True),
+                # breaking on the first non-degenerate result. The dynamic token
+                # budget was already applied to qwen_model.max_new_tokens by the
+                # outer transcribe() call; we forward it as the scene limit.
+                scene_dur = audio_duration if audio_duration is not None else (self._get_audio_duration(audio) if self.model is not None else 0.0)
+                limit = scene_token_limit if scene_token_limit is not None else (qwen_model.max_new_tokens if qwen_model is not None else 4096)
+                _text, result, _fallback_used, _temp_used = self._decode_with_fallback(
                     audio=str(audio),
                     context=qwen_context,  # Pass context to improve accuracy
                     language=qwen_language,
                     return_time_stamps=True,
+                    scene_token_limit=limit,
+                    audio_duration_sec=scene_dur,
                 )
 
-                if not results:
+                if result is None:
                     logger.warning("qwen-asr returned empty results")
                     return []
 
-                result = results[0]
-
                 # DIAGNOSTIC: Log raw result stats
                 raw_text = getattr(result, 'text', '')
-                logger.info(f"[DIAG] qwen-asr raw result:")
-                logger.info(f"[DIAG]   text length: {len(raw_text)} chars")
-                logger.info(f"[DIAG]   first 100 chars: '{raw_text[:100]}...'")
+                logger.debug(f"[DIAG] qwen-asr raw result:")
+                logger.debug(f"[DIAG]   text length: {len(raw_text)} chars")
+                logger.debug(f"[DIAG]   first 100 chars: '{raw_text[:100]}...'")
 
                 # Store detected language
                 if hasattr(result, 'language'):
                     detected_language_holder[0] = result.language
-                    logger.info(f"[DIAG]   detected language: {result.language}")
+                    logger.debug(f"[DIAG]   detected language: {result.language}")
 
                 # Get timestamps from ForcedAligner
                 time_stamps = getattr(result, 'time_stamps', None)
-                logger.info(f"[DIAG]   timestamps count: {len(time_stamps) if time_stamps else 0}")
+                logger.debug(f"[DIAG]   timestamps count: {len(time_stamps) if time_stamps else 0}")
 
                 if not time_stamps:
                     # No word timestamps - return text as single "word"
@@ -877,13 +1213,13 @@ class QwenASR:
                 # DIAGNOSTIC: Log word extraction stats
                 total_duration = words[-1]['end'] if words else 0
                 total_chars = sum(len(w['word']) for w in words)
-                logger.info(f"[DIAG] Words merged: {len(words)} words, {total_chars} chars, duration: {total_duration:.2f}s")
+                logger.debug(f"[DIAG] Words merged: {len(words)} words, {total_chars} chars, duration: {total_duration:.2f}s")
                 if words:
                     # Show first/last words (truncate if too long for logging)
                     first_word = words[0]['word'][:20] + ('...' if len(words[0]['word']) > 20 else '')
                     last_word = words[-1]['word'][:20] + ('...' if len(words[-1]['word']) > 20 else '')
-                    logger.info(f"[DIAG]   first word: '{first_word}' @ {words[0]['start']:.2f}s")
-                    logger.info(f"[DIAG]   last word: '{last_word}' @ {words[-1]['end']:.2f}s")
+                    logger.debug(f"[DIAG]   first word: '{first_word}' @ {words[0]['start']:.2f}s")
+                    logger.debug(f"[DIAG]   last word: '{last_word}' @ {words[-1]['end']:.2f}s")
 
                 # === SAVE DEBUG ARTIFACTS (when artifacts_dir is provided) ===
                 if save_artifacts_dir:
@@ -964,13 +1300,13 @@ class QwenASR:
 
             # DIAGNOSTIC: Log regrouped result stats
             segment_count = len(result.segments) if result.segments else 0
-            logger.info(f"[DIAG] stable_whisper.transcribe_any() result:")
-            logger.info(f"[DIAG]   segment count: {segment_count}")
+            logger.debug(f"[DIAG] stable_whisper.transcribe_any() result:")
+            logger.debug(f"[DIAG]   segment count: {segment_count}")
             if result.segments:
                 total_text = ''.join(seg.text for seg in result.segments)
-                logger.info(f"[DIAG]   total text length: {len(total_text)} chars")
-                logger.info(f"[DIAG]   first segment: '{result.segments[0].text[:50]}...'")
-                logger.info(f"[DIAG]   last segment: '{result.segments[-1].text[:50]}...'")
+                logger.debug(f"[DIAG]   total text length: {len(total_text)} chars")
+                logger.debug(f"[DIAG]   first segment: '{result.segments[0].text[:50]}...'")
+                logger.debug(f"[DIAG]   last segment: '{result.segments[-1].text[:50]}...'")
 
             logger.debug(f"transcribe_any returned {segment_count} segments")
 
@@ -1026,7 +1362,13 @@ class QwenASR:
 
             return result
 
-    def _transcribe_without_aligner(self, audio_path: Path, effective_context: str = "") -> stable_whisper.WhisperResult:
+    def _transcribe_without_aligner(
+        self,
+        audio_path: Path,
+        effective_context: str = "",
+        audio_duration: Optional[float] = None,
+        scene_token_limit: Optional[int] = None,
+    ) -> stable_whisper.WhisperResult:
         """
         Transcribe without ForcedAligner (no word timestamps).
 
@@ -1044,20 +1386,26 @@ class QwenASR:
             # Normalize language to qwen-asr format (e.g., 'ja' -> 'Japanese')
             qwen_language = self._normalize_language_for_qwen(self.language)
 
-            results = self.model.transcribe(
+            # --- Full temperature fallback ladder (v1.9.0, Change 2) ---
+            # The no-aligner coupled path previously had no fallback. Route it
+            # through _decode_with_fallback() so coupled-mode users get the same
+            # Whisper-style ladder as the assembly path. _decode_with_fallback()
+            # restores the generation config and token budget itself.
+            scene_dur = audio_duration if audio_duration is not None else self._get_audio_duration(audio_path)
+            limit = scene_token_limit if scene_token_limit is not None else self._compute_dynamic_token_limit(scene_dur)
+            full_text, result, _fallback_used, _temp_used = self._decode_with_fallback(
                 audio=str(audio_path),
                 context=effective_context,  # Pass context to improve accuracy
                 language=qwen_language,
                 return_time_stamps=False,
+                scene_token_limit=limit,
+                audio_duration_sec=scene_dur,
             )
 
-            if not results:
+            if result is None:
                 logger.warning("qwen-asr returned empty results")
                 # Return empty result
                 return stable_whisper.WhisperResult({'segments': [], 'language': 'ja'})
-
-            result = results[0]
-            full_text = getattr(result, 'text', '').strip()
 
             # Store detected language
             if hasattr(result, 'language'):
@@ -1217,6 +1565,7 @@ class QwenASR:
         contexts: Optional[List[str]] = None,
         language: Optional[str] = None,
         audio_durations: Optional[List[float]] = None,
+        retry_blank_output: bool = False,
     ) -> List[str]:
         """
         Batch text generation WITHOUT forced alignment.
@@ -1292,33 +1641,44 @@ class QwenASR:
 
                 # Dynamic token budget (v1.8.9+): scale max_new_tokens to audio duration
                 scene_token_limit = self._compute_dynamic_token_limit(dur or 0)
-                original_max_tokens = self.model.max_new_tokens
-                self.model.max_new_tokens = scene_token_limit
-                try:
-                    result = self.model.transcribe(
-                        audio=[audio_inputs[i]],
-                        context=[ctx_list[i]],
-                        language=qwen_language,
-                        return_time_stamps=False,
-                    )
-                finally:
-                    self.model.max_new_tokens = original_max_tokens
+
+                # --- Full temperature fallback ladder (v1.9.0, Change 2) ---
+                # Replaces the single 0.4 retry with the Whisper-style ladder
+                # (0.0→0.2→0.4→0.6→0.8→1.0), breaking on the first non-degenerate
+                # result. Conservative-hybrid decoding: the base pass is greedy
+                # (Qwen3-ASR official recipe); escape-valve penalties engage only
+                # on fallback steps. _decode_with_fallback() restores the
+                # generation config and token budget in a finally block.
+                #
+                # Passes audio_inputs[i], not a stringified path: upstream v1.9.0
+                # made this an AudioLike (str path OR (np.ndarray, 16000)) so the
+                # orchestrator can run pathless with in-memory frame audio. The
+                # ladder forwards it to transcribe() untouched, so both forms work.
+                text, result, fallback_used, temperature_used = self._decode_with_fallback(
+                    audio=audio_inputs[i],
+                    context=ctx_list[i],
+                    language=qwen_language,
+                    return_time_stamps=False,
+                    scene_token_limit=scene_token_limit,
+                    audio_duration_sec=dur or 0,
+                    retry_blank_output=retry_blank_output,
+                )
 
                 scene_elapsed = time.time() - scene_start
-                text = getattr(result[0], 'text', '').strip() if result else ''
 
                 # Per-scene log line (visible even without tqdm)
                 chars = len(text)
                 speed = chars / scene_elapsed if scene_elapsed > 0 else 0
                 budget_info = f", budget={scene_token_limit}" if scene_token_limit != self.max_new_tokens else ""
+                fallback_info = " [FALLBACK]" if fallback_used else ""
                 logger.info(
-                    "  Scene %d/%d: %d chars in %.1fs (%.1f chars/s) | audio=%s%s",
-                    i + 1, n, chars, scene_elapsed, speed, dur_str, budget_info,
+                    "  Scene %d/%d: %d chars in %.1fs (%.1f chars/s) | audio=%s%s%s",
+                    i + 1, n, chars, scene_elapsed, speed, dur_str, budget_info, fallback_info,
                 )
 
                 # Store detected language from first non-empty result
                 if text and self._detected_language is None and result:
-                    lang = getattr(result[0], 'language', None)
+                    lang = getattr(result, 'language', None)
                     if lang:
                         self._detected_language = lang
 
@@ -1744,6 +2104,14 @@ class QwenASR:
     def cleanup(self) -> None:
         """Cleanup resources. Alias for unload_model()."""
         self.unload_model()
+
+    def __enter__(self):
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager, ensuring cleanup."""
+        self.cleanup()
 
     @property
     def detected_language(self) -> Optional[str]:

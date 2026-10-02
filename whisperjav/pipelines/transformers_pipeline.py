@@ -37,6 +37,7 @@ from whisperjav.modules.speech_enhancement import (
     enhance_single_audio,
     get_extraction_sample_rate,
     is_passthrough_backend,
+    SCENE_EXTRACTION_SR,
 )
 
 
@@ -76,7 +77,7 @@ class TransformersPipeline(BasePipeline):
         hf_device: str = "auto",
         hf_dtype: str = "auto",
         # Qwen3-ASR specific config (when asr_backend="qwen")
-        qwen_model_id: str = "Qwen/Qwen3-ASR-1.7B",
+        qwen_model_id: str = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
         qwen_device: str = "auto",
         qwen_dtype: str = "auto",
         qwen_batch_size: int = 1,  # batch_size=1 for accuracy

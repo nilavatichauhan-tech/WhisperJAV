@@ -13,8 +13,10 @@ from whisperjav.modules.subtitle_pipeline.protocols import TextGenerator
 # Registry: name → "module.path.ClassName"
 _REGISTRY: dict[str, str] = {
     "qwen3": "whisperjav.modules.subtitle_pipeline.generators.qwen3.Qwen3TextGenerator",
+    "qwen3-vllm": "whisperjav.modules.subtitle_pipeline.generators.qwen3_vllm.Qwen3vLLMTextGenerator",
     "anime-whisper": "whisperjav.modules.subtitle_pipeline.generators.anime_whisper.AnimeWhisperGenerator",
     "cohere": "whisperjav.modules.subtitle_pipeline.generators.cohere.CohereTextGenerator",
+    "speculative": "whisperjav.modules.subtitle_pipeline.generators.speculative_generator.SpeculativeQwen3Generator",
 }
 
 # Cache for loaded classes

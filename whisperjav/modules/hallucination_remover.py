@@ -571,18 +571,26 @@ class HallucinationRemover:
                 }]
                 return '', modifications
 
+        current_text = text
+        all_mods = []
+
         # Apply regex patterns from regexp_v09.json (closing phrases, sound effects, etc.)
         if self._regex_patterns:
             regex_text, regex_mods = self._apply_regex_matching(normalized_text)
             if regex_mods:
+                all_mods.extend(regex_mods)
                 # If regex fully emptied the text, remove the subtitle
                 if not regex_text.strip():
-                    return '', regex_mods
-                # If regex partially stripped (e.g., parenthetical prefix removed),
-                # return the cleaned text
-                return regex_text.strip(), regex_mods
+                    return '', all_mods
+                current_text = regex_text.strip()
 
-        return text, []
+        # Apply fuzzy matching
+        fuzzy_text, fuzzy_mods = self._apply_fuzzy_matching(current_text)
+        if fuzzy_mods:
+            all_mods.extend(fuzzy_mods)
+            return fuzzy_text, all_mods
+
+        return current_text, all_mods
 
     def _is_bracketed_context(self, text: str) -> Optional[Dict[str, Any]]:
         stripped = text.strip()

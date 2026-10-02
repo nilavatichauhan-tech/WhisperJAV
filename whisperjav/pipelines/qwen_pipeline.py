@@ -121,9 +121,10 @@ class QwenPipeline(BasePipeline):
         segmenter_start_pad_ms: int = 100,  # v1.9.0 asymmetric pad before speech onset
         segmenter_end_pad_ms: int = 100,    # v1.9.0 JAV retune: symmetric 100/100 (owner-validated end pad)
         segmenter_config: Optional[Dict[str, Any]] = None,  # GUI/CLI custom segmenter params
+        coverage_rescue: bool = True,
 
         # Qwen ASR (Phase 5)
-        model_id: str = "Qwen/Qwen3-ASR-1.7B",
+        model_id: str = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
         device: str = "auto",
         dtype: str = "auto",
         batch_size: int = 1,
@@ -174,16 +175,32 @@ class QwenPipeline(BasePipeline):
         stepdown_fallback_group: float = 6.0,
 
         # Generation safety controls
-        repetition_penalty: float = 1.1,              # Pipeline default: conservative penalty for JAV
+        # Conservative-hybrid decoding (v1.9.0): the base pass follows Qwen3-ASR's
+        # official greedy recipe (repetition_penalty=1.0, no_repeat_ngram_size=0,
+        # do_sample=False, temperature inert). These escape-valve penalties engage
+        # ONLY on fallback retries inside _decode_with_fallback(). Setting them >1
+        # here opts into the power-user sampling path (do_sample=True), which
+        # distorts logits on clean speech — left at 1.0 by default.
+        repetition_penalty: float = 1.0,              # Base pass: 1.0 (off). Fallback engages 1.1 automatically.
         max_tokens_per_audio_second: float = 20.0,    # Pipeline default: dynamic scaling enabled
 
         # Generator backend selection (v1.8.6+)
         # "qwen3" (default) uses Qwen3-ASR text-only mode.
+        # "qwen3-vllm" delegates to vLLM REST server.
         # "anime-whisper" uses litagin/anime-whisper (HF Whisper fine-tune).
         generator_backend: str = "qwen3",
+        qwen_vllm_url: Optional[str] = None,
 
         # Output
         subs_language: str = "native",
+
+        # Decoding / quality controls (v1.9.0)
+        qwen_num_beams: int = 1,
+        qwen_do_sample: bool = False,
+        qwen_temperature: float = 1.0,
+        qwen_context_propagation: bool = True,
+        qwen_no_repeat_ngram_size: int = 0,
+        qwen_temperature_fallback: bool = True,
 
         **kwargs,
     ):
@@ -197,6 +214,9 @@ class QwenPipeline(BasePipeline):
 
         # Progress display
         self.progress_display = progress_display
+
+        # Cross-scene context propagation
+        self.context_propagation = qwen_context_propagation
 
         # === Input Mode Configuration ===
         # Parse input mode — legacy modes are mapped to assembly configs
@@ -252,6 +272,7 @@ class QwenPipeline(BasePipeline):
         self.segmenter_start_pad_ms = segmenter_start_pad_ms
         self.segmenter_end_pad_ms = segmenter_end_pad_ms
         self.segmenter_config = segmenter_config or {}
+        self.coverage_rescue = coverage_rescue
 
         # Adaptive Step-Down config
         self.stepdown_enabled = stepdown_enabled
@@ -298,6 +319,7 @@ class QwenPipeline(BasePipeline):
 
         # Generator backend selection (v1.8.6+)
         self.generator_backend = generator_backend
+        self.qwen_vllm_url = qwen_vllm_url
 
         # anime-whisper preset: vad_only (skip ForcedAligner, save ~1GB VRAM),
         # passthrough cleaner, no step-down (no aligner = no collapse),
@@ -358,6 +380,11 @@ class QwenPipeline(BasePipeline):
             "postprocess_preset": postprocess_preset,
             "repetition_penalty": repetition_penalty,
             "max_tokens_per_audio_second": max_tokens_per_audio_second,
+            "num_beams": qwen_num_beams,
+            "do_sample": qwen_do_sample,
+            "temperature": qwen_temperature,
+            "no_repeat_ngram_size": qwen_no_repeat_ngram_size,
+            "temperature_fallback": qwen_temperature_fallback,
         }
         self.model_id = model_id
 
@@ -466,6 +493,7 @@ class QwenPipeline(BasePipeline):
                 "max_group_duration_s": self.segmenter_max_group_duration,
                 "chunk_threshold_s": self.segmenter_chunk_threshold,
                 "segmenter_config": _framer_segmenter_config,
+                "coverage_rescue": self.coverage_rescue,
             }
         elif self.framer_backend == "srt-source":
             if not self.framer_srt_path:
@@ -505,6 +533,14 @@ class QwenPipeline(BasePipeline):
                 language=cfg.get("language", "ja"),
                 max_new_tokens=cfg.get("max_new_tokens", 512),
             )
+        elif self.generator_backend == "qwen3-vllm":
+            generator = TextGeneratorFactory.create(
+                "qwen3-vllm",
+                model_id=cfg["model_id"],
+                api_url=self.qwen_vllm_url,
+                language=cfg["language"],
+                max_new_tokens=cfg["max_new_tokens"],
+            )
         else:
             # Default: Qwen3 text-only mode (existing behavior)
             generator = TextGeneratorFactory.create(
@@ -518,6 +554,11 @@ class QwenPipeline(BasePipeline):
                 repetition_penalty=cfg["repetition_penalty"],
                 max_tokens_per_audio_second=cfg["max_tokens_per_audio_second"],
                 attn_implementation=cfg["attn_implementation"],
+                num_beams=cfg.get("num_beams", 1),
+                do_sample=cfg.get("do_sample", False),
+                temperature=cfg.get("temperature", 1.0),
+                no_repeat_ngram_size=cfg.get("no_repeat_ngram_size", 0),
+                temperature_fallback=cfg.get("temperature_fallback", True),
             )
 
         # TextCleaner: auto-selected based on generator backend
@@ -575,6 +616,7 @@ class QwenPipeline(BasePipeline):
             language=cfg.get("language", "ja"),
             context=cfg.get("context", ""),
             stepdown_config=stepdown_cfg,
+            context_propagation=self.context_propagation,
         )
 
     # ------------------------------------------------------------------
@@ -1029,7 +1071,7 @@ class QwenPipeline(BasePipeline):
         # ("…", "…?", "…」", etc.) and renumber surviving entries.
         phase8_start = time.time()
 
-        # v1.8.12.post2: anime-whisper-specific SRT filter.
+        # v1.8.12.post2: anime-whisper-specific SRT filter or generic Qwen postprocessor.
         # Operates IN PLACE on stitched_srt_path BEFORE the copy to final.
         anime_filter_stats = None
         if self.generator_backend == "anime-whisper" and num_subtitles > 0:
@@ -1249,6 +1291,5 @@ class QwenPipeline(BasePipeline):
         self.cleanup_temp_files(media_basename)
 
         return master_metadata
-
 
 

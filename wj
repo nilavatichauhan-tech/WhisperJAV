@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run this v1.9.1 clone's code against the venv that lives in the 1.8.14 tree.
+#
+# That venv has whisperjav installed editable, pointing at the OLD directory
+# (__editable__.whisperjav-1.8.14.pth -> __editable___whisperjav_1_8_14_finder).
+# Prefixing PYTHONPATH with this clone takes precedence over that finder, so
+# the clone's source is what actually runs while the multi-GB dependencies
+# (torch, transformers, qwen-asr) stay shared instead of duplicated.
+#
+# Usage:
+#   ./wj                       ... -> whisperjav ...            (transcribe)
+#   ./wj translate             ... -> whisperjav-translate ...
+#   ./wj bench|upgrade|gui     ... -> whisperjav-<that> ...
+#
+# Nothing here modifies the venv or the 1.8.14 tree.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="/home/Tobi/.gemini/antigravity/scratch/WhisperJAV/.venv"
+
+script="whisperjav"
+case "${1:-}" in
+  translate|bench|upgrade|gui) script="whisperjav-$1"; shift ;;
+esac
+
+if [[ ! -x "$VENV/bin/$script" ]]; then
+  echo "wj: $VENV/bin/$script not found or not executable" >&2
+  exit 1
+fi
+
+exec env PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" "$VENV/bin/$script" "$@"

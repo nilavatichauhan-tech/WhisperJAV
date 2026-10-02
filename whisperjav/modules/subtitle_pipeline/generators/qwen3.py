@@ -38,7 +38,7 @@ class Qwen3TextGenerator:
 
     def __init__(
         self,
-        model_id: str = "Qwen/Qwen3-ASR-1.7B",
+        model_id: str = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
         device: str = "auto",
         dtype: str = "auto",
         batch_size: int = 1,
@@ -47,6 +47,11 @@ class Qwen3TextGenerator:
         repetition_penalty: float = 1.1,
         max_tokens_per_audio_second: float = 20.0,
         attn_implementation: str = "auto",
+        num_beams: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        no_repeat_ngram_size: int = 0,
+        temperature_fallback: bool = True,
     ):
         """
         Store configuration for deferred QwenASR construction.
@@ -62,6 +67,9 @@ class Qwen3TextGenerator:
             repetition_penalty: HF generation_config penalty (1.0 = off).
             max_tokens_per_audio_second: Dynamic per-scene token budget scaling.
             attn_implementation: Attention implementation strategy.
+            num_beams: Number of beams for beam search (default: 1).
+            do_sample: Whether to use sampling during generation (default: False).
+            temperature: Temperature for generation sampling (default: 1.0).
         """
         self._config = {
             "model_id": model_id,
@@ -73,6 +81,11 @@ class Qwen3TextGenerator:
             "repetition_penalty": repetition_penalty,
             "max_tokens_per_audio_second": max_tokens_per_audio_second,
             "attn_implementation": attn_implementation,
+            "num_beams": num_beams,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "temperature_fallback": temperature_fallback,
         }
         self._asr = None  # QwenASR instance, created in load()
         self._loaded = False
@@ -107,6 +120,11 @@ class Qwen3TextGenerator:
             repetition_penalty=cfg["repetition_penalty"],
             max_tokens_per_audio_second=cfg["max_tokens_per_audio_second"],
             attn_implementation=cfg["attn_implementation"],
+            num_beams=cfg["num_beams"],
+            do_sample=cfg["do_sample"],
+            temperature=cfg["temperature"],
+            no_repeat_ngram_size=cfg["no_repeat_ngram_size"],
+            temperature_fallback=cfg["temperature_fallback"],
         )
         self._asr.load_model_text_only()
         self._loaded = True
@@ -183,12 +201,14 @@ class Qwen3TextGenerator:
 
         # Extract audio durations if provided in kwargs (for progress display)
         audio_durations = kwargs.get("audio_durations")
+        retry_blank_output = bool(kwargs.get("retry_blank_output", False))
 
         texts = self._asr.transcribe_text_only(
             audio_paths=list(audio_paths),
             contexts=contexts,
             language=language,
             audio_durations=audio_durations,
+            retry_blank_output=retry_blank_output,
         )
 
         # Wrap raw text strings in TranscriptionResult
